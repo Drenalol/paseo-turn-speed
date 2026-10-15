@@ -124,6 +124,9 @@ paseo plugin reload turn-speed
 paseo plugin ls     # status of every installed plugin
 ```
 
+Releasing a new version (npm + registry flow, with the gotchas): see
+[RELEASE.md](RELEASE.md).
+
 `npm run check:client` compiles the client entry with the same options Paseo's
 compiler uses and rejects output the mobile app's JS engine (Hermes) cannot
 parse — notably anonymous class expressions, which is exactly what a `class`
