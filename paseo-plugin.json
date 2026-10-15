@@ -1,0 +1,10 @@
+{
+  "id": "turn-speed",
+  "name": "Turn speed",
+  "description": "Live decode tok/s, prefill/TTFT, and a token breakdown for every agent turn, right in the composer.",
+  "icon": "assets/icon.png",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.0"
+  }
+}

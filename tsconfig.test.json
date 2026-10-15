@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "outDir": ".tmp-test",
+    "noEmit": false
+  },
+  "include": ["client/meter.ts", "client/format.ts", "client/meter.test.ts", "client/format.test.ts"]
+}
