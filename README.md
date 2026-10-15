@@ -30,6 +30,10 @@ token totals, steps, tool wait and context occupancy:
 
 <img src="images/desktop-popover.png" alt="Turn breakdown popover" width="420">
 
+The same popover on mobile, with the `pill shows` basis chips:
+
+<img src="images/mobile-popover.png" alt="Mobile popover" width="300">
+
 ## Requirements
 
 - Paseo **0.11.0+** (daemon and app).
@@ -106,7 +110,7 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
 | Option | Default | Effect |
 | --- | --- | --- |
 | Show pills for idle agents | off | otherwise pills appear only around observed turns |
-| Speed basis | Decode time only | decode windows vs whole-turn active time for finished turns |
+| Speed basis | Live decode | what the pill shows: live estimate, decode-window average, or whole-turn rate |
 | Token format | 1.2k | compact or grouped digits |
 | Live smoothing window | 2 s | averaging window of the live tok/s |
 | Manual chars per token | off (auto-calibrated) | override the live character estimate |

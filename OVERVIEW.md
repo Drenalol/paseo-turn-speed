@@ -13,8 +13,9 @@ Without usage the plugin estimates tokens from streamed characters, marks them
 with `≈`, and auto-calibrates a per-model chars/token ratio from every step that
 does report usage.
 
-Options live under Settings → Plugins → Turn speed: smoothing window for the
-live number, decode-only vs whole-turn basis, token format, idle-pill
+Options live under Settings → Plugins → Turn speed: what the pill leads with
+(live estimate, decode-window average, or whole-turn rate, switchable from the
+popover), smoothing window for the live number, token format, idle-pill
 visibility, and a manual chars/token override. Requires Paseo 0.11 or later.
 Turns are observed live; history from before a plugin reload is not
 reconstructed, and subagents get their own pills instead of parent totals.

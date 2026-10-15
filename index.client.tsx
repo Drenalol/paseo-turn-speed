@@ -315,7 +315,9 @@ export default function contribute(client: PluginClientContext) {
     };
     reseed();
 
-    const details = makeSpeedDetails(store, () => prefs, () => effectiveCpt(store.model));
+    const details = makeSpeedDetails(store, () => prefs, () => effectiveCpt(store.model), () => {
+      void refreshPrefs();
+    });
     let pillHandle: { destroy(): void } | null = null;
     try {
       pillHandle = bindPill(

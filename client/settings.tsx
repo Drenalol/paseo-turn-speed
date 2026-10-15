@@ -63,10 +63,11 @@ export function makeSettingsScreen(onSaved: () => void): ComponentType<PluginSur
             />
             <SettingsSelect
               label="Speed basis"
-              hint="Decode excludes tool waits and prefill; whole turn divides tokens by total turn time."
+              hint="Live estimates the running call and falls back to decode windows; Decode averages decode windows only; Whole turn divides tokens by turn time (user waits excluded)."
               value={values.numerator}
               options={[
-                { label: "Decode time only", value: "decode" },
+                { label: "Live decode (default)", value: "live" },
+                { label: "Decode windows", value: "decode" },
                 { label: "Whole turn", value: "turn" },
               ]}
               onValueChange={(v) => save({ numerator: v })}

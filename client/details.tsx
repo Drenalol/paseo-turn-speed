@@ -1,11 +1,12 @@
 import type { ComponentType } from "react";
 import { useMemo } from "react";
-import { Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { useSyncExternalStore } from "react";
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
+import { useSettings } from "@getpaseo/plugin/client";
 import { approx, fmtDuration, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
-import type { Preferences } from "../shared/preferences";
+import { preferences, type Preferences } from "../shared/preferences";
 
 type Styles = ReturnType<typeof buildStyles>;
 
@@ -24,6 +25,25 @@ function buildStyles(theme: PluginButtonContentProps["theme"], compact: boolean)
     label: { color: theme.colors.foregroundMuted, fontSize: 12 },
     value: { color: theme.colors.foreground, fontSize: 12, fontVariant: ["tabular-nums" as const] },
     hint: { color: theme.colors.statusWarning, fontSize: 11, marginTop: 2 },
+    basis: { flexDirection: "row" as const, justifyContent: "space-between" as const, alignItems: "center" as const, gap: 8 },
+    chips: { flexDirection: "row" as const, gap: 4 },
+    chip: {
+      borderRadius: 6,
+      borderWidth: 1,
+      borderColor: theme.colors.border,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+    },
+    chipOn: {
+      borderRadius: 6,
+      borderWidth: 1,
+      borderColor: theme.colors.accent,
+      backgroundColor: theme.colors.accent,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+    },
+    chipText: { color: theme.colors.foregroundMuted, fontSize: 11 },
+    chipTextOn: { color: theme.colors.accentForeground, fontSize: 11, fontWeight: "600" as const },
   };
 }
 
@@ -44,9 +64,11 @@ export function makeSpeedDetails(
   store: AgentSpeedStore,
   getPrefs: () => Preferences,
   charsPerToken: () => number,
+  onPrefsSaved: () => void,
 ): ComponentType<PluginButtonContentProps> {
   return function SpeedDetails({ theme, layout }: PluginButtonContentProps) {
     useSyncExternalStore(store.subscribe, store.getSnapshot);
+    const settings = useSettings(preferences);
     const styles = useMemo(() => buildStyles(theme, layout.compact), [theme, layout.compact]);
     const prefs = getPrefs();
     const now = Date.now();
@@ -55,6 +77,15 @@ export function makeSpeedDetails(
     const cpt = charsPerToken();
     const running = state.phase === "running";
     const live = running ? store.liveTokPerSec(prefs.liveWindowSec) : null;
+    const basis = settings.status === "ready" ? settings.values.numerator : null;
+    const setBasis = (value: "live" | "decode" | "turn") => {
+      if (settings.status !== "ready" || settings.values.numerator === value) return;
+      void settings
+        .save({ ...settings.values, numerator: value }, settings.revision)
+        .then((ok) => {
+          if (ok) onPrefsSaved();
+        });
+    };
     const prefillRate =
       summary.firstStepPromptTokens !== null && summary.prefillMs !== null && summary.prefillMs > 0
         ? summary.firstStepPromptTokens / (summary.prefillMs / 1000)
@@ -75,6 +106,26 @@ export function makeSpeedDetails(
             </Text>
           ) : null}
         </View>
+        {basis !== null ? (
+          <View style={styles.basis}>
+            <Text style={styles.label}>pill shows</Text>
+            <View style={styles.chips}>
+              {(["live", "decode", "whole"] as const).map((label) => {
+                const value = label === "whole" ? "turn" : label;
+                const on = basis === value;
+                return (
+                  <Pressable
+                    key={label}
+                    onPress={() => setBasis(value)}
+                    style={on ? styles.chipOn : styles.chip}
+                  >
+                    <Text style={on ? styles.chipTextOn : styles.chipText}>{label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+        ) : null}
         {running && live !== null ? (
           <Row styles={styles} label={`live (${prefs.liveWindowSec}s)`} value={fmtTokPerSec(live, summary.approx)} />
         ) : null}

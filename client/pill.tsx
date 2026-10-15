@@ -12,14 +12,13 @@ export interface PillView {
   title: string;
 }
 
-/** Number the pill leads with, per the numerator preference. */
+/** Number the pill leads with, per the speed-basis preference. */
 function headlineTokPerSec(store: AgentSpeedStore, prefs: Preferences, now: number): number | null {
-  const running = store.isRunning();
-  if (running) {
+  const summary = store.summary(now);
+  if (store.isRunning() && prefs.numerator === "live") {
     const live = store.liveTokPerSec(prefs.liveWindowSec);
     if (live !== null) return live;
   }
-  const summary = store.summary(now);
   if (prefs.numerator === "turn") return summary.tokPerSecTurn ?? summary.tokPerSecDecode;
   return summary.tokPerSecDecode ?? summary.tokPerSecTurn;
 }

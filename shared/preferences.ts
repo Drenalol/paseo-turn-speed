@@ -9,8 +9,8 @@ export const preferences = defineSettings({
   schema: z.object({
     /** Smoothing window for the live tok/s number, in seconds. */
     liveWindowSec: z.union([z.literal(1), z.literal(2), z.literal(5)]).default(2),
-    /** Which time basis the pill number uses for finished turns. */
-    numerator: z.enum(["decode", "turn"]).default("decode"),
+    /** What the pill leads with, while running and after the turn. */
+    numerator: z.enum(["live", "decode", "turn"]).default("live"),
     /** Keep pills visible for agents with no locally observed turn. */
     showIdlePills: z.boolean().default(false),
     /** Manual chars/token override for the live estimate; null means auto. */
