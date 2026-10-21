@@ -2,9 +2,10 @@
 
 A composer pill per agent that shows how fast the model is actually decoding:
 `⚡ 138 tok/s · 0.8k` while a turn runs, `139 tok/s · 1.2k tok` after it ends,
-with a popover breakdown (prefill/TTFT, in/cached/out tokens, steps, tool wait,
-context occupancy). Numbers measured from real provider usage are exact;
-before the first usage event they are character estimates marked with `≈`.
+with a popover breakdown (prefill/TTFT, in/out tokens, prompt cache hit rate,
+steps, tool wait, context occupancy). Numbers measured from real provider
+usage are exact; before the first usage event they are character estimates
+marked with `≈`.
 
 ## Install
 
@@ -92,6 +93,26 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   after reloads and reconnects), and are removed from decode windows, tool-wait
   time and the whole-turn rate. `turn time` stays wall-clock; the popover shows a
   separate `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
+- **Prompt cache hit rate** — `cacheRead / (newInput + cacheWrite + cacheRead)`
+  per model call, summed over the turn. The numerator is the prompt the model
+  did not have to recompute; the denominator is the whole prompt, so cache
+  writes count against the rate — they are tokens the model had to process even
+  though they missed the cache. Shown in the popover, and in the pill label
+  when enabled in settings.
+
+  Providers report cache reads in two shapes: OpenAI-compatible ones fold them
+  into the prompt counter, Anthropic-style ones report cache reads on top of it.
+  The plugin infers the shape per call (a cache read larger than the prompt can
+  only mean separate counters) and Settings → Turn speed → Prompt cache can pin
+  it explicitly.
+
+  Paseo's `AgentUsage` exposes only `inputTokens` and `cachedInputTokens`, with
+  no cache-write counter, so the `cacheWrite` term is always `0` today and the
+  formula collapses to `cacheRead / (newInput + cacheRead)`. For an
+  Anthropic-backed model whose TTL cache is being rebuilt mid-turn the reported
+  rate will therefore read high by the size of the rebuild. The term is already
+  plumbed through (`UsageSnapshot.cacheWrite` → `StepRecord.cacheWriteTokens`),
+  so a protocol field is a one-line change to the client's usage mapper.
 - **Live number inside a model call** — real tokens only arrive at the end of a
   call, so the live value estimates tokens from characters over a 1/2/5 s
   smoothing window and is marked `≈` until the call's usage lands.
@@ -112,6 +133,8 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
 | Show pills for idle agents | off | otherwise pills appear only around observed turns |
 | Speed basis | Live decode | what the pill shows: live estimate, decode-window average, or whole-turn rate |
 | Token format | 1.2k | compact or grouped digits |
+| Cache hit rate in the pill | off | append `· 86% cached` to the pill; the popover always shows the row |
+| Cache read accounting | Auto | whether the provider reports cache reads inside or on top of the prompt counter |
 | Live smoothing window | 2 s | averaging window of the live tok/s |
 | Manual chars per token | off (auto-calibrated) | override the live character estimate |
 | Implausible rate limit | 400 tok/s | steps implying a faster decode are dropped as misattributed usage |
@@ -141,6 +164,15 @@ check:client` runs the real Hermes syntax check too.
 - The plugin only counts what it watches live: after a reload or a reconnect the
   interrupted turn is not reconstructed (final `lastUsage` still gives totals).
 - Subagent turns get their own pills and are never added to the parent's numbers.
+- The cache hit rate is only as good as the provider's cache counters: without
+  `cachedInputTokens` the popover hides the row, and providers that report a
+  `cached` counter with a different meaning (some sum cache writes into it)
+  will read higher than the true hit rate.
+- Cache **writes** are not reported by Paseo's usage payload at all, so a turn
+  that rebuilds an Anthropic TTL cache reads as a higher hit rate than it
+  really was: the denominator is missing those tokens. See
+  [Prompt cache hit rate](#how-the-numbers-are-computed) for the exact formula
+  and the plumbing already in place for when the protocol gains the field.
 - Usage that arrives late from a previous turn (typically after an interrupted
   message) is dropped by the plausibility guard, so that turn's token totals can
   be slightly low; rates stay honest.

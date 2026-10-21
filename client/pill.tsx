@@ -1,5 +1,5 @@
 import type { PluginButton, PluginButtonRegistration } from "@getpaseo/plugin/client";
-import { approx, fmtDuration, fmtRate, fmtTokens } from "./format";
+import { approx, fmtDuration, fmtPercent, fmtRate, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
 import type { Preferences } from "../shared/preferences";
 
@@ -40,11 +40,14 @@ export function computePillView(store: AgentSpeedStore, prefs: Preferences, now:
   const rateText = rate === null ? "\u2014" : `${approx(fmtRate(rate), isApprox)} tok/s`;
   const running = phase === "running";
   const waiting = summary.waiting;
-  // The composer track is narrow: the pill carries the decode rate only, and
-  // the turn state (live vs waiting) is shown solely by the leading icon.
-  // Tokens, prefill and wait time live in the popover; the full picture goes
-  // into the accessible title.
+  // The composer track is narrow: the pill carries the decode rate and, when
+  // enabled, the turn's cache hit rate; turn state (live vs waiting) is shown
+  // by the leading icon. Tokens, prefill and wait time live in the popover;
+  // the full picture goes into the accessible title.
   const labelParts: string[] = [rateText];
+  if (prefs.showCacheInPill && summary.cacheHitRate !== null) {
+    labelParts.push(`\u00b7 ${fmtPercent(summary.cacheHitRate)} cached`);
+  }
   if (phase === "failed") labelParts.push("\u00b7 failed");
   if (phase === "canceled") labelParts.push("\u00b7 canceled");
   const titleParts = [`Turn speed ${rateText} decode`];
@@ -53,6 +56,7 @@ export function computePillView(store: AgentSpeedStore, prefs: Preferences, now:
     titleParts.push(`${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), isApprox)} tok`);
   }
   if (summary.prefillMs !== null) titleParts.push(`TTFT ${fmtDuration(summary.prefillMs)}`);
+  if (summary.cacheHitRate !== null) titleParts.push(`cache ${fmtPercent(summary.cacheHitRate)}`);
   return {
     label: labelParts.join(" "),
     icon: waiting ? "Pause" : running ? "Zap" : "Activity",

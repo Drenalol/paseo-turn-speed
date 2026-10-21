@@ -1,9 +1,11 @@
 import {
+  cacheStats,
   calibrate,
   initialMeterState,
   reduceMeter,
   summarizeTurn,
   DEFAULT_CHARS_PER_TOKEN,
+  type CacheCountingMode,
   type MeterAction,
   type MeterState,
   type TurnSummary,
@@ -25,6 +27,8 @@ export interface AgentSpeedStoreDeps {
   learnedCharsPerToken(model: string): number | undefined;
   /** Called when a step produced a new chars/token measurement to persist. */
   onCalibration(model: string, charsPerToken: number): void;
+  /** How the provider reports prompt cache reads (see `cacheStats`). */
+  cacheCounting(): CacheCountingMode;
   now(): number;
 }
 
@@ -74,7 +78,7 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
   };
 
   const summary = (at?: number): TurnSummary =>
-    summarizeTurn(state, deps.charsPerToken(model), at ?? now());
+    summarizeTurn(state, deps.charsPerToken(model), at ?? now(), deps.cacheCounting());
 
   const pushSample = () => {
     if (state.phase !== "running") {
@@ -137,9 +141,12 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
       if (next.steps.length > prev.steps.length) {
         const step = next.steps[next.steps.length - 1];
         const rate = step.decodeMs > 0 ? (step.outTokens / (step.decodeMs / 1000)).toFixed(1) : "inf";
+        const stepCache = cacheStats(step.inputTokens, step.cachedTokens, deps.cacheCounting());
+        const hit = stepCache.hitRate === null ? "n/a" : `${Math.round(stepCache.hitRate * 100)}%`;
         console.log(
           `turn-speed: step ok [${deps.agentId.slice(0, 8)}] out=${step.outTokens} in=${step.inputTokens}` +
-            ` cached=${step.cachedTokens} decodeMs=${Math.round(step.decodeMs)} waitMs=${Math.round(step.waitMs)} rate=${rate}`,
+            ` cached=${step.cachedTokens} (${hit}) decodeMs=${Math.round(step.decodeMs)}` +
+            ` waitMs=${Math.round(step.waitMs)} rate=${rate}`,
         );
       }
       if (next.stepRejected) {
