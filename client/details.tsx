@@ -4,7 +4,7 @@ import { Pressable, Text, View } from "react-native";
 import { useSyncExternalStore } from "react";
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
-import { approx, fmtDuration, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
+import { approx, fmtDuration, fmtPercent, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
 import { preferences, type Preferences } from "../shared/preferences";
 
@@ -144,11 +144,21 @@ export function makeSpeedDetails(
         <Row
           styles={styles}
           label="tokens"
-          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} · cached ${fmtTokens(
-            summary.cachedTokens,
-            prefs.tokenFormat,
-          )} · out ${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), summary.approx)}`}
+          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} · out ${approx(
+            fmtTokens(summary.estTokens, prefs.tokenFormat),
+            summary.approx,
+          )}`}
         />
+        {summary.cacheHitRate !== null ? (
+          <Row
+            styles={styles}
+            label="cache hit"
+            value={`${fmtPercent(summary.cacheHitRate)} · cached ${fmtTokens(
+              summary.cachedTokens,
+              prefs.tokenFormat,
+            )} / ${fmtTokens(summary.promptTokens, prefs.tokenFormat)}`}
+          />
+        ) : null}
         {state.ctxUsed !== null && state.ctxMax !== null ? (
           <Row
             styles={styles}
