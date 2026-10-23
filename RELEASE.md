@@ -38,13 +38,20 @@ public installs use `npm:paseo-turn-speed`.
 - **Publishing requires 2FA.** The account uses a passkey. The passkey CLI flow
   only exists in npm 11+; the npm first in `PATH` (`~/.local/bin/npm`, hermes
   bundle) is 10.9.8 and fails with `EOTP`. Use `/usr/local/bin/npm publish`.
+- The web session in `~/.npmrc` expires; then `npm publish` fails with a
+  misleading `404 PUT` (not 401) before any prompt appears. Check with
+  `npm whoami` and refresh via `npm login --auth-type=web` first. Both login
+  and publish print their own one-time URL (`/login/cli/…`, `/auth/cli/…`)
+  that needs a browser passkey confirmation within minutes — in a
+  non-interactive shell, drive each via `expect` and scrape the URL from the
+  expect `log_file`.
+- npm is deprecating 2FA-bypassing automation tokens for direct publishing
+  (banner: "npm tokens that bypass 2FA are being restricted"), so per-release
+  web confirmation is the expected future flow, not a regression.
 - The publish command prints `https://www.npmjs.com/auth/cli/<id>` and waits for
   the browser passkey confirmation. The CLI session expires in minutes — open
   the link promptly. Without a TTY, wrap it in a PTY (`expect`) so the
   "Press ENTER to open in the browser..." prompt gets answered.
-- `npm login --auth-type=web` behaves the same way: the browser step must finish
-  while the CLI is still polling, otherwise it falls back to a `Username:`
-  prompt and dies in non-interactive shells.
 
 ## Manifest restrictions from the paseo.cafe scanner
 
@@ -74,3 +81,9 @@ Other registry-validation rules that bit us:
   (PR getpaseo/plugins#476) the same day.
 - v1.0.1 — manifest trimmed to the scanner allow-list; cafe admission passed
   after re-submission (paseo-cafe#380/#381 merged).
+- 2026-10-23 — v1.1.0 published: subagent awareness (delegated-time exclusion,
+  team badge, per-child popover via `paseo.parent-agent-id` labels). npm web
+  session had expired — republished after `npm login --auth-type=web` plus a
+  separate `/auth/cli/` confirmation for the publish itself (see gotchas).
+  Registry bump PR is opened by the bot after the staged publish resolves;
+  cafe re-scans automatically.
