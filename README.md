@@ -1,10 +1,12 @@
 # turn-speed — live token-rate meter for Paseo agents
 
 A composer pill per agent that shows how fast the model is actually decoding:
-`⚡ 138 tok/s · 0.8k` while a turn runs, `139 tok/s · 1.2k tok` after it ends,
-with a popover breakdown (prefill/TTFT, in/cached/out tokens, steps, tool wait,
-context occupancy). Numbers measured from real provider usage are exact;
-before the first usage event they are character estimates marked with `≈`.
+`⚡ 138 tok/s` while a turn runs, `⏸ 43 tok/s` while it waits for your answer,
+`12.4 tok/s · 2 sub` while subagents do the heavy lifting, and the final rate
+once the turn ends — with a popover breakdown (prefill/TTFT, in/cached/out
+tokens, steps, tool wait, user wait, per-subagent rates, context occupancy).
+Numbers measured from real provider usage are exact; before the first usage
+event they are character estimates marked with `≈`.
 
 ## Install
 
@@ -85,13 +87,23 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   model call are excluded. This is why the pill shows ~139 tok/s on short
   answers instead of 6.
 - **Whole-turn tok/s** — optional alternative basis in settings; it includes
-  tool time and is always lower. Time spent waiting for you is excluded.
+  tool time and is always lower. Time spent waiting for you and time delegated
+  to subagents are excluded.
 - **Waiting for you** — when the model asks a question or waits for a permission
   or plan approval it is asleep until you answer. Those intervals are taken from
   the provider's permission/question requests (and restored from agent snapshots
   after reloads and reconnects), and are removed from decode windows, tool-wait
   time and the whole-turn rate. `turn time` stays wall-clock; the popover shows a
   separate `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
+- **Delegation to subagents** — while the agent's work runs in subagents, the
+  parent's own model produces nothing, so that stretch is removed from its
+  whole-turn rate like a user wait. Delegation is detected from the parent's
+  timeline (`sub_agent` tool details where the provider reports them, and the
+  normalized `subagent` tool calls Paseo emits for provider subagents such as
+  OpenCode's Task) and from linked Paseo child agents. The parent's pill grows
+  a `· N sub` badge, its accessible title carries the team's combined tok/s,
+  and the popover lists every subagent with its own live rate and tokens plus a
+  `team` total. Each linked subagent still gets its own pill in its own composer.
 - **Live number inside a model call** — real tokens only arrive at the end of a
   call, so the live value estimates tokens from characters over a 1/2/5 s
   smoothing window and is marked `≈` until the call's usage lands.
@@ -140,7 +152,15 @@ check:client` runs the real Hermes syntax check too.
   provider's per-call usage updates. Providers without usage at all stay `≈`.
 - The plugin only counts what it watches live: after a reload or a reconnect the
   interrupted turn is not reconstructed (final `lastUsage` still gives totals).
-- Subagent turns get their own pills and are never added to the parent's numbers.
+- Subagent turns get their own pills; the parent's numbers stay its own and
+  subagent *tokens* are never added to them — delegation time is excluded and
+  team rates are shown alongside, not merged. Paseo-native (delegated) agents
+  are linked through their `paseo.parent-agent-id` label, so they get the full
+  per-child breakdown. Provider subagents (e.g. OpenCode Task calls) do not
+  appear as Paseo agents and their token stream is not reachable from the
+  plugin API, so for them the badge, the `delegated` time and the rate
+  correction work, but the per-child token breakdown stays empty
+  (verified on Paseo 0.12 + OpenCode).
 - Usage that arrives late from a previous turn (typically after an interrupted
   message) is dropped by the plausibility guard, so that turn's token totals can
   be slightly low; rates stay honest.

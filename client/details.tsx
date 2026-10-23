@@ -1,11 +1,11 @@
 import type { ComponentType } from "react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useReducer, useSyncExternalStore } from "react";
 import { Pressable, Text, View } from "react-native";
-import { useSyncExternalStore } from "react";
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
 import { approx, fmtDuration, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
+import { EMPTY_TEAM, type TeamView } from "./team";
 import { preferences, type Preferences } from "../shared/preferences";
 
 type Styles = ReturnType<typeof buildStyles>;
@@ -65,6 +65,7 @@ export function makeSpeedDetails(
   getPrefs: () => Preferences,
   charsPerToken: () => number,
   onPrefsSaved: () => void,
+  getTeamView: () => TeamView | null = () => null,
 ): ComponentType<PluginButtonContentProps> {
   return function SpeedDetails({ theme, layout }: PluginButtonContentProps) {
     useSyncExternalStore(store.subscribe, store.getSnapshot);
@@ -74,6 +75,16 @@ export function makeSpeedDetails(
     const now = Date.now();
     const state = store.state;
     const summary = store.summary(now);
+    const team = getTeamView() ?? EMPTY_TEAM;
+    // Children emit on their own stores; while any runs, a slow tick keeps
+    // their numbers moving between the parent's own repaints.
+    const [, tick] = useReducer((n: number) => n + 1, 0);
+    const teamActive = team.running > 0;
+    useEffect(() => {
+      if (!teamActive) return undefined;
+      const timer = setInterval(() => tick(), 500);
+      return () => clearInterval(timer);
+    }, [teamActive]);
     const cpt = charsPerToken();
     const running = state.phase === "running";
     const live = running ? store.liveTokPerSec(prefs.liveWindowSec) : null;
@@ -166,6 +177,38 @@ export function makeSpeedDetails(
             styles={styles}
             label={summary.waiting ? "waiting for you" : "user wait"}
             value={fmtDuration(summary.userWaitMs)}
+          />
+        ) : null}
+        {team.members.length > 0 || summary.delegated || summary.delegatedMs > 0 ? (
+          <Row
+            styles={styles}
+            label={summary.delegated ? "subagents" : "delegated"}
+            value={
+              team.running > 0
+                ? `${team.running} running \u00b7 ${fmtDuration(summary.delegatedMs)}`
+                : fmtDuration(summary.delegatedMs)
+            }
+          />
+        ) : null}
+        {team.members.slice(0, 5).map((member) => (
+          <Row
+            key={member.id}
+            styles={styles}
+            label={member.title ?? member.id.slice(0, 8)}
+            value={`${member.running ? fmtTokPerSec(member.liveTokPerSec, member.approx) : "\u2713"} \u00b7 ${approx(
+              fmtTokens(member.estTokens, prefs.tokenFormat),
+              member.approx,
+            )} tok`}
+          />
+        ))}
+        {team.running > 0 && (team.liveTokPerSec !== null || team.estTokens > 0) ? (
+          <Row
+            styles={styles}
+            label="team"
+            value={`${fmtTokPerSec(team.liveTokPerSec, team.approx)} \u00b7 ${approx(
+              fmtTokens(team.estTokens, prefs.tokenFormat),
+              team.approx,
+            )} tok`}
           />
         ) : null}
         {summary.totalMs !== null ? (

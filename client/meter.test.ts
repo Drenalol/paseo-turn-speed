@@ -335,3 +335,59 @@ test("calibration blends with EMA 0.7/0.3, clamps, and rejects thin samples", ()
   assert.equal(calibrate(4, 400, 0), null);
   assert.equal(calibrate(4, 100, 100), 0.7 * 4 + 0.3 * 1); // observed 1 kept, clamped later
 });
+
+test("delegated intervals are removed from the whole-turn rate", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 100 } });
+  // Subagents do the real work for 10s; the parent produces nothing itself.
+  s = reduceMeter(s, { t: "delegated_started", at: 2000 });
+  s = reduceMeter(s, { t: "delegated_ended", at: 12000 });
+  s = reduceMeter(s, { t: "turn_ended", at: 12000, kind: "completed" });
+  const sum = summarizeTurn(s, CPT, 12000);
+  assert.equal(sum.delegatedMs, 10000);
+  assert.equal(sum.delegated, false);
+  assert.equal(sum.totalMs, 12000);
+  // 100 tokens over 2 productive seconds, not 12 wall seconds.
+  assert.equal(sum.tokPerSecTurn, 50);
+});
+
+test("overlapping user wait and delegation subtract once from turn time", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 100 } });
+  s = reduceMeter(s, { t: "delegated_started", at: 2000 });
+  s = reduceMeter(s, { t: "user_wait_started", at: 3000 });
+  s = reduceMeter(s, { t: "user_wait_ended", at: 8000 });
+  s = reduceMeter(s, { t: "delegated_ended", at: 12000 });
+  s = reduceMeter(s, { t: "turn_ended", at: 12000, kind: "completed" });
+  const sum = summarizeTurn(s, CPT, 12000);
+  // Union of asleep time is 2000..12000; the nested user wait must not
+  // subtract a second time.
+  assert.equal(sum.userWaitMs, 5000);
+  assert.equal(sum.delegatedMs, 10000);
+  assert.equal(sum.tokPerSecTurn, 50);
+});
+
+test("open delegation counts while running and closes at turn end", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "delegated_started", at: 5000 });
+  let sum = summarizeTurn(s, CPT, 8000);
+  assert.equal(sum.delegated, true);
+  assert.equal(sum.delegatedMs, 3000);
+  s = reduceMeter(s, { t: "turn_ended", at: 10000, kind: "completed" });
+  assert.equal(s.delegatedAt, null);
+  assert.equal(s.delegatedWaits.length, 1);
+  sum = summarizeTurn(s, CPT, 10000);
+  assert.equal(sum.delegated, false);
+  assert.equal(sum.delegatedMs, 5000);
+});
+
+test("delegation outside a running turn is a no-op", () => {
+  const idle = initialMeterState();
+  assert.equal(reduceMeter(idle, { t: "delegated_started", at: 100 }), idle);
+  assert.equal(reduceMeter(idle, { t: "delegated_ended", at: 100 }), idle);
+  const running = startTurn();
+  assert.equal(reduceMeter(running, { t: "delegated_ended", at: 100 }), running);
+});

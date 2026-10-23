@@ -1,6 +1,7 @@
 import type { PluginButton, PluginButtonRegistration } from "@getpaseo/plugin/client";
 import { approx, fmtDuration, fmtRate, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
+import type { TeamView } from "./team";
 import type { Preferences } from "../shared/preferences";
 
 const PILL_REFRESH_MS = 500;
@@ -23,7 +24,12 @@ function headlineTokPerSec(store: AgentSpeedStore, prefs: Preferences, now: numb
   return summary.tokPerSecDecode ?? summary.tokPerSecTurn;
 }
 
-export function computePillView(store: AgentSpeedStore, prefs: Preferences, now: number): PillView {
+export function computePillView(
+  store: AgentSpeedStore,
+  prefs: Preferences,
+  now: number,
+  team?: TeamView | null,
+): PillView {
   const state = store.state;
   const phase = state.phase;
   if (phase === "idle") {
@@ -40,15 +46,30 @@ export function computePillView(store: AgentSpeedStore, prefs: Preferences, now:
   const rateText = rate === null ? "\u2014" : `${approx(fmtRate(rate), isApprox)} tok/s`;
   const running = phase === "running";
   const waiting = summary.waiting;
+  const teamRunning = team && phase === "running" && team.running > 0 ? team : null;
   // The composer track is narrow: the pill carries the decode rate only, and
   // the turn state (live vs waiting) is shown solely by the leading icon.
   // Tokens, prefill and wait time live in the popover; the full picture goes
   // into the accessible title.
   const labelParts: string[] = [rateText];
+  if (teamRunning) labelParts.push(`\u00b7 ${teamRunning.running} sub`);
   if (phase === "failed") labelParts.push("\u00b7 failed");
   if (phase === "canceled") labelParts.push("\u00b7 canceled");
   const titleParts = [`Turn speed ${rateText} decode`];
   if (waiting) titleParts.push("waiting for you");
+  if (teamRunning) {
+    const teamRate = teamRunning.liveTokPerSec;
+    const teamLabel = `${teamRunning.running} subagent${teamRunning.running === 1 ? "" : "s"}`;
+    if (teamRate !== null) {
+      titleParts.push(`${teamLabel} at ${approx(fmtRate(teamRate), teamRunning.approx)} tok/s`);
+    } else if (teamRunning.estTokens > 0) {
+      titleParts.push(
+        `${teamLabel} working (${approx(fmtTokens(teamRunning.estTokens, prefs.tokenFormat), teamRunning.approx)} tok)`,
+      );
+    } else {
+      titleParts.push(`${teamLabel} working`);
+    }
+  }
   if (summary.estTokens > 0) {
     titleParts.push(`${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), isApprox)} tok`);
   }
@@ -76,8 +97,10 @@ export function bindPill(
   store: AgentSpeedStore,
   getPrefs: () => Preferences,
   now: () => number,
+  getTeam?: () => TeamView | null,
 ): PillRegistrationHandle {
-  const first = computePillView(store, getPrefs(), now());
+  const view = (t: number) => computePillView(store, getPrefs(), t, getTeam ? getTeam() : null);
+  const first = view(now());
   let registration = register({ ...buttonBase, ...first });
   let lastPaint = 0;
   let pendingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -94,8 +117,13 @@ export function bindPill(
       return;
     }
     lastPaint = t;
-    const view = computePillView(store, getPrefs(), t);
-    registration.update({ label: view.label, icon: view.icon, visible: view.visible, title: view.title });
+    const viewNow = view(t);
+    registration.update({
+      label: viewNow.label,
+      icon: viewNow.icon,
+      visible: viewNow.visible,
+      title: viewNow.title,
+    });
   };
 
   const unsubscribe = store.subscribe(() => paint(false));

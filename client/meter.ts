@@ -16,7 +16,11 @@
  * Whenever the provider reports the model is blocked on the user (a question
  * or permission request), that interval is tracked separately: it is removed
  * from step decode/wait windows and from the whole-turn rate, while the turn
- * clock itself keeps running in wall time.
+ * clock itself keeps running in wall time. While the agent's work runs in
+ * subagents (a delegated interval), that time is likewise removed from the
+ * whole-turn rate — the subagents' own pills carry their speed — but it stays
+ * inside decode/wait windows, because a delegated call is just another tool
+ * run between the agent's model calls.
  */
 
 /** A live-window text gap longer than this is treated as a stall. */
@@ -99,6 +103,10 @@ export interface MeterState {
   userWaits: readonly UserWaitInterval[];
   /** Start of the open user-wait interval, null when the model is live. */
   pausedAt: number | null;
+  /** Completed intervals where the agent's work ran in subagents. */
+  delegatedWaits: readonly UserWaitInterval[];
+  /** Start of the open delegation interval, null while the agent runs alone. */
+  delegatedAt: number | null;
   /** True once any real usage step landed during this turn. */
   sawUsage: boolean;
   /** Set when a usage delta was dropped as physically impossible. */
@@ -118,6 +126,10 @@ export type MeterAction =
   | { t: "user_wait_started"; at: number }
   /** The user answered: the model woke up. */
   | { t: "user_wait_ended"; at: number }
+  /** Subagents of this agent started running: the model is delegated. */
+  | { t: "delegated_started"; at: number }
+  /** All subagents finished: the agent works alone again. */
+  | { t: "delegated_ended"; at: number }
   | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null }
   /** Drop the locally observed turn (epoch replacement, reconnect, reload). */
   | { t: "reset" };
@@ -146,6 +158,8 @@ export function initialMeterState(): MeterState {
     totalChars: 0,
     userWaits: [],
     pausedAt: null,
+    delegatedWaits: [],
+    delegatedAt: null,
     sawUsage: false,
     stepRejected: null,
     calibInput: null,
@@ -243,6 +257,45 @@ function closeWait(state: MeterState, at: number): MeterState {
       };
 }
 
+/** Move the open delegation interval into the completed list. */
+function closeDelegated(state: MeterState, at: number): MeterState {
+  return state.delegatedAt === null
+    ? state
+    : {
+        ...state,
+        delegatedAt: null,
+        delegatedWaits: [
+          ...state.delegatedWaits,
+          { start: state.delegatedAt, end: Math.max(at, state.delegatedAt) },
+        ],
+      };
+}
+
+/** Milliseconds inside [from, to] covered by at least one interval, counting
+ * overlapping intervals once (a user wait during a delegation is one pause,
+ * not two). */
+function unionOverlapMs(intervals: readonly UserWaitInterval[], from: number, to: number): number {
+  if (to <= from) return 0;
+  const clipped = intervals
+    .map((wait) => [Math.max(wait.start, from), Math.min(wait.end, to)] as const)
+    .filter(([start, end]) => end > start)
+    .sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let runStart = Number.NEGATIVE_INFINITY;
+  let runEnd = Number.NEGATIVE_INFINITY;
+  for (const [start, end] of clipped) {
+    if (start > runEnd) {
+      if (runEnd > runStart) total += runEnd - runStart;
+      runStart = start;
+      runEnd = end;
+    } else if (end > runEnd) {
+      runEnd = end;
+    }
+  }
+  if (runEnd > runStart) total += runEnd - runStart;
+  return total;
+}
+
 function applyUsage(
   state: MeterState,
   at: number,
@@ -333,8 +386,14 @@ function endTurn(
   // A repeated cumulative payload contributes no delta and opens no step.
   const withUsage = usage ? applyUsage(state, at, usage, maxTokPerSec) : state;
   if (withUsage.phase !== "running") return state;
-  // A turn that ends while a question is still open closes the wait there.
-  return { ...closeWait(withUsage, at), phase: kind, endedAt: at, endNote: note };
+  // A turn that ends while a question is still open closes the wait there;
+  // same for an ongoing delegation.
+  return {
+    ...closeDelegated(closeWait(withUsage, at), at),
+    phase: kind,
+    endedAt: at,
+    endNote: note,
+  };
 }
 
 export function reduceMeter(state: MeterState, action: MeterAction): MeterState {
@@ -372,6 +431,13 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
     case "user_wait_ended":
       // An end for a wait we never saw (resolved before attach) is a no-op.
       return state.pausedAt === null ? state : closeWait(state, action.at);
+    case "delegated_started":
+      return state.phase === "running" && state.delegatedAt === null
+        ? { ...state, delegatedAt: action.at }
+        : state;
+    case "delegated_ended":
+      // An end for a delegation we never saw is a no-op.
+      return state.delegatedAt === null ? state : closeDelegated(state, action.at);
     case "turn_ended":
       return endTurn(state, action.at, action.kind, action.usage, action.maxTokPerSec, action.note ?? null);
     case "reset":
@@ -412,6 +478,10 @@ export interface TurnSummary {
   userWaitMs: number;
   /** True while an open user-wait interval is running. */
   waiting: boolean;
+  /** Wall milliseconds this turn's work ran inside subagents. */
+  delegatedMs: number;
+  /** True while at least one subagent is running right now. */
+  delegated: boolean;
   tokPerSecDecode: number | null;
   /** Tokens per second over turn time minus user waits. */
   tokPerSecTurn: number | null;
@@ -460,9 +530,19 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
   let userWaitMs = 0;
   for (const wait of state.userWaits) userWaitMs += Math.max(0, wait.end - wait.start);
   if (state.pausedAt !== null && end !== null) userWaitMs += Math.max(0, end - state.pausedAt);
+  let delegatedMs = 0;
+  for (const wait of state.delegatedWaits) delegatedMs += Math.max(0, wait.end - wait.start);
+  if (state.delegatedAt !== null && end !== null) delegatedMs += Math.max(0, end - state.delegatedAt);
   // The turn's productive time: wall clock minus the stretches where the
-  // model was asleep waiting for the user.
-  const activeMs = totalMs !== null ? Math.max(0, totalMs - userWaitMs) : null;
+  // agent produced nothing itself — blocked on the user or delegated to
+  // subagents. Overlapping stretches count once.
+  const asleep: UserWaitInterval[] = [...state.userWaits, ...state.delegatedWaits];
+  if (state.pausedAt !== null && end !== null) asleep.push({ start: state.pausedAt, end });
+  if (state.delegatedAt !== null && end !== null) asleep.push({ start: state.delegatedAt, end });
+  const activeMs =
+    totalMs !== null && state.startedAt !== null && end !== null
+      ? Math.max(0, totalMs - unionOverlapMs(asleep, state.startedAt, end))
+      : null;
   const tokPerSecDecode =
     decodeMs > 0 && estTokens > 0 ? (outTokens ?? estTokens) / (decodeMs / 1000) : null;
   const tokPerSecTurn =
@@ -477,6 +557,8 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
     totalMs,
     userWaitMs,
     waiting: state.pausedAt !== null && state.phase === "running",
+    delegatedMs,
+    delegated: state.delegatedAt !== null && state.phase === "running",
     tokPerSecDecode,
     tokPerSecTurn,
     steps: state.steps.length,

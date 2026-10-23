@@ -3,6 +3,8 @@ import { settingsRpc } from "@getpaseo/plugin";
 import { createAgentSpeedStore, type AgentSpeedStore } from "./client/store";
 import { bindPill } from "./client/pill";
 import { makeSpeedDetails } from "./client/details";
+import { parentAgentIdOf } from "./client/links";
+import { summarizeTeam, type TeamMemberInput } from "./client/team";
 import { makeSettingsScreen } from "./client/settings";
 import {
   DEFAULT_METER_STATE,
@@ -29,6 +31,15 @@ interface Attachment {
   detach(): void;
 }
 
+/** Paseo normalizes subagent-spawning tool calls to the name "subagent";
+ * providers that map them richly use the `sub_agent` detail type instead.
+ * (Measured on Paseo 0.12 + OpenCode: name="subagent", detail.type="unknown".) */
+const SUB_AGENT_TOOL_NAME = /^sub[-_. ]?agent$/i;
+
+function isSubAgentCall(item: { name: string; detail: { type?: string } }): boolean {
+  return item.detail.type === "sub_agent" || SUB_AGENT_TOOL_NAME.test(item.name);
+}
+
 const CAL_FLUSH_MS = 2000;
 
 export default function contribute(client: PluginClientContext) {
@@ -36,6 +47,13 @@ export default function contribute(client: PluginClientContext) {
   const attached = new Map<string, Attachment>();
   const calibration = new Map<string, number>();
   const pendingCalibration = new Map<string, number>();
+  // Subagent topology, fed by the agent-list subscription: the latest
+  // snapshot per agent, which agent is whose child, which provider session
+  // id belongs to which agent, and each attachment's team-change callback.
+  const snapshots = new Map<string, AgentSnapshot>();
+  const childParents = new Map<string, string>();
+  const sessionOwners = new Map<string, string>();
+  const teamWatchers = new Map<string, Set<() => void>>();
   let prefs: Preferences = DEFAULT_PREFERENCES;
   let calFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let listSubscription: { release(): Promise<void> } | null = null;
@@ -43,6 +61,65 @@ export default function contribute(client: PluginClientContext) {
   const aborted = () => lifetime.signal.aborted;
   const logError = (...args: unknown[]) => {
     if (!aborted()) console.error("turn-speed:", ...args);
+  };
+
+  const notifyTeam = (parentId: string): void => {
+    for (const listener of teamWatchers.get(parentId) ?? []) {
+      try {
+        listener();
+      } catch (error) {
+        logError(`team update failed for ${parentId}`, error);
+      }
+    }
+  };
+
+  const linkChild = (childId: string, parentId: string): void => {
+    if (childId === parentId) return;
+    const current = childParents.get(childId);
+    if (current === parentId) return;
+    childParents.set(childId, parentId);
+    console.log(`turn-speed: linked child ${childId.slice(0, 8)} -> parent ${parentId.slice(0, 8)}`);
+    notifyTeam(parentId);
+    if (current) notifyTeam(current);
+  };
+
+  /** Fold a fresh agent snapshot into the topology maps. */
+  const remember = (agent: AgentSnapshot): void => {
+    const previous = snapshots.get(agent.id);
+    snapshots.set(agent.id, agent);
+    const sessionId = agent.runtimeInfo?.sessionId ?? agent.persistence?.sessionId ?? null;
+    if (sessionId) sessionOwners.set(sessionId, agent.id);
+    const parent = parentAgentIdOf(agent);
+    if (parent) linkChild(agent.id, parent);
+    // A child starting or finishing its turn changes the parent's team even
+    // when the link itself did not change. Deferred one microtask so the
+    // calling handler finishes seeding the child's own store first.
+    if (
+      parent &&
+      previous &&
+      (previous.status !== agent.status || previous.archivedAt !== agent.archivedAt)
+    ) {
+      queueMicrotask(() => notifyTeam(parent));
+    }
+  };
+
+  /** Live attached children of `parentId`, for the team view. */
+  const teamMembers = (parentId: string): TeamMemberInput[] => {
+    const members: TeamMemberInput[] = [];
+    for (const [childId, pid] of childParents) {
+      if (pid !== parentId) continue;
+      const attachment = attached.get(childId);
+      const snapshot = snapshots.get(childId);
+      if (!attachment || !snapshot) continue;
+      if (snapshot.archivedAt || snapshot.status === "closed") continue;
+      members.push({
+        id: childId,
+        title: snapshot.title ?? null,
+        model: snapshot.model ?? null,
+        store: attachment.store,
+      });
+    }
+    return members;
   };
 
   const effectiveCpt = (model: string | null): number => {
@@ -146,11 +223,15 @@ export default function contribute(client: PluginClientContext) {
     event: StreamEvent,
     reseed: () => void,
     waits: Set<string>,
+    agentId: string,
+    subCalls: Set<string>,
+    onSubChange: () => void,
   ): void {
     const at = Date.now();
     switch (event.type) {
       case "turn_started": {
         waits.clear();
+        subCalls.clear();
         const startedAt = handle.activeTurn?.startedAt;
         const parsed = startedAt ? Date.parse(startedAt) : Number.NaN;
         store.dispatch({
@@ -158,10 +239,12 @@ export default function contribute(client: PluginClientContext) {
           at: Number.isFinite(parsed) ? parsed : at,
           turnId: event.turnId ?? handle.activeTurn?.turnId ?? null,
         });
+        onSubChange();
         break;
       }
       case "turn_completed":
         waits.clear();
+        subCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
@@ -169,15 +252,20 @@ export default function contribute(client: PluginClientContext) {
           usage: event.usage ? mapUsage(event.usage) : undefined,
           maxTokPerSec: prefs.maxPlausibleTokPerSec,
         });
+        onSubChange();
         void refreshPrefs();
         break;
       case "turn_failed":
         waits.clear();
+        subCalls.clear();
         store.dispatch({ t: "turn_ended", at, kind: "failed", note: event.error });
+        onSubChange();
         break;
       case "turn_canceled":
         waits.clear();
+        subCalls.clear();
         store.dispatch({ t: "turn_ended", at, kind: "canceled", note: event.reason });
+        onSubChange();
         break;
       case "permission_requested":
       case "permission_resolved": {
@@ -210,6 +298,29 @@ export default function contribute(client: PluginClientContext) {
           });
         } else if (item.type === "compaction") {
           store.dispatch({ t: "compaction", at });
+        } else if (item.type === "tool_call" && isSubAgentCall(item)) {
+          // A subagent call: running/closed drives the parent's delegation
+          // interval, and its child session id (when the provider reports
+          // one) links the child agent to this parent for the team view.
+          const detail = item.detail;
+          console.log(
+            `turn-speed: subagent call [${agentId.slice(0, 8)}]` +
+              ` ${String(item.callId).slice(0, 8)} ${item.status}`,
+          );
+          const childId = detail.type === "sub_agent" && detail.childSessionId
+            ? sessionOwners.get(detail.childSessionId)
+            : undefined;
+          if (childId) linkChild(childId, agentId);
+          if (item.callId) {
+            if (item.status === "running") {
+              if (!subCalls.has(item.callId)) {
+                subCalls.add(item.callId);
+                onSubChange();
+              }
+            } else if (subCalls.delete(item.callId)) {
+              onSubChange();
+            }
+          }
         }
         break;
       }
@@ -217,7 +328,9 @@ export default function contribute(client: PluginClientContext) {
       case "subscription_restored":
         // Do not replay history we never saw; the live window is local anyway.
         waits.clear();
+        subCalls.clear();
         store.dispatch({ t: "reset" });
+        onSubChange();
         // Provider counters kept moving while we were blind: re-read them so
         // the next delta is the new work, not the whole unseen gap.
         reseed();
@@ -232,6 +345,7 @@ export default function contribute(client: PluginClientContext) {
 
   function attach(agent: AgentSnapshot): void {
     if (aborted() || attached.has(agent.id) || !agent.workspaceId) return;
+    remember(agent);
     const workspaceId = agent.workspaceId;
     const handle = client.paseo.agents.ref(agent.id);
     const store = createAgentSpeedStore({
@@ -315,9 +429,57 @@ export default function contribute(client: PluginClientContext) {
     };
     reseed();
 
-    const details = makeSpeedDetails(store, () => prefs, () => effectiveCpt(store.model), () => {
-      void refreshPrefs();
-    });
+    // Delegation: open sub_agent tool calls (or linked children that are
+    // running) mean the agent's own model is idle while subagents work, so
+    // the meter parks that time like a user wait. `subCalls` survives
+    // snapshot re-delivery of the same running tool item.
+    const subCalls = new Set<string>();
+    let delegatedNow = false;
+    const syncDelegated = (): void => {
+      let should = subCalls.size > 0;
+      if (!should) {
+        for (const member of teamMembers(agent.id)) {
+          if (member.store.isRunning()) {
+            should = true;
+            break;
+          }
+        }
+      }
+      if (store.state.phase !== "running") {
+        // Outside a turn there is no interval to open or close; drop the
+        // flag so the next turn re-evaluates from scratch.
+        delegatedNow = false;
+        return;
+      }
+      if (should === delegatedNow) return;
+      delegatedNow = should;
+      console.log(`turn-speed: delegation ${should ? "on" : "off"} [${agent.id.slice(0, 8)}]`);
+      store.dispatch({ t: should ? "delegated_started" : "delegated_ended", at: Date.now() });
+    };
+    const team = () => {
+      const view = summarizeTeam(teamMembers(agent.id), prefs.liveWindowSec, Date.now());
+      // Open sub_agent tool calls count too: on provider subagents (no
+      // linked Paseo child) they are the only running signal.
+      const running = Math.max(view.running, subCalls.size);
+      if (view.members.length === 0 && running === 0) return null;
+      if (view.members.length === 0) {
+        return { members: [], running, liveTokPerSec: null, estTokens: 0, approx: true };
+      }
+      return { ...view, running };
+    };
+    const teamWatchersForParent = teamWatchers.get(agent.id) ?? new Set<() => void>();
+    teamWatchersForParent.add(syncDelegated);
+    teamWatchers.set(agent.id, teamWatchersForParent);
+
+    const details = makeSpeedDetails(
+      store,
+      () => prefs,
+      () => effectiveCpt(store.model),
+      () => {
+        void refreshPrefs();
+      },
+      team,
+    );
     let pillHandle: { destroy(): void } | null = null;
     try {
       pillHandle = bindPill(
@@ -329,6 +491,7 @@ export default function contribute(client: PluginClientContext) {
         store,
         () => prefs,
         () => Date.now(),
+        team,
       );
     } catch (error) {
       logError(`pill registration failed for agent ${agent.id}`, error);
@@ -340,6 +503,7 @@ export default function contribute(client: PluginClientContext) {
         return;
       }
       const snapshot = update.agent;
+      remember(snapshot);
       store.setIdentity(snapshot.provider, snapshot.model ?? null);
       observeUsage(snapshot.lastUsage ?? null);
       syncWaits(snapshot);
@@ -349,7 +513,7 @@ export default function contribute(client: PluginClientContext) {
 
     const timelineSub = handle.timeline.subscribe((event) => {
       try {
-        onStreamEvent(store, handle, event.event, reseed, pendingWaits);
+        onStreamEvent(store, handle, event.event, reseed, pendingWaits, agent.id, subCalls, syncDelegated);
       } catch (error) {
         logError(`timeline event failed for ${agent.id}`, error);
       }
@@ -359,17 +523,38 @@ export default function contribute(client: PluginClientContext) {
     attached.set(agent.id, {
       store,
       detach() {
+        storeTeamWatch?.();
+        storeTeamWatch = null;
+        teamWatchersForParent.delete(syncDelegated);
         pillHandle?.destroy();
         releaseAgentUpdates();
         void timelineSub.release().catch(() => undefined);
       },
     });
+    // A child's phase turning running/idle may not coincide with any agent
+    // status update, so the parent re-evaluates delegation on every change
+    // of this store too. The lookup is dynamic: links learned after attach
+    // (e.g. from a sub_agent tool item) are covered as well.
+    let storeTeamWatch: (() => void) | null = store.subscribe(() => {
+      const parentLink = childParents.get(agent.id);
+      if (parentLink) notifyTeam(parentLink);
+    });
+    // Children may already run (attach raced a reload): pick that up now.
+    syncDelegated();
   }
 
   function detach(agentId: string): void {
     const attachment = attached.get(agentId);
     if (!attachment) return;
     attached.delete(agentId);
+    const snapshot = snapshots.get(agentId);
+    snapshots.delete(agentId);
+    teamWatchers.delete(agentId);
+    const parent = childParents.get(agentId);
+    childParents.delete(agentId);
+    if (parent) notifyTeam(parent);
+    const sessionId = snapshot?.runtimeInfo?.sessionId ?? snapshot?.persistence?.sessionId ?? null;
+    if (sessionId && sessionOwners.get(sessionId) === agentId) sessionOwners.delete(sessionId);
     try {
       attachment.detach();
     } catch (error) {
@@ -381,7 +566,10 @@ export default function contribute(client: PluginClientContext) {
     for (const entry of entries) {
       const agent = entry.agent;
       if (agent.archivedAt || agent.status === "closed") detach(agent.id);
-      else attach(agent);
+      else {
+        remember(agent);
+        attach(agent);
+      }
     }
   }
 
@@ -410,7 +598,10 @@ export default function contribute(client: PluginClientContext) {
           }
           const agent = payload.agent;
           if (agent.archivedAt || agent.status === "closed") detach(agent.id);
-          else attach(agent);
+          else {
+            remember(agent);
+            attach(agent);
+          }
         },
         error: (error) => logError("agent list subscription failed", error),
       });
@@ -440,6 +631,10 @@ export default function contribute(client: PluginClientContext) {
       calFlushTimer = null;
     }
     for (const agentId of [...attached.keys()]) detach(agentId);
+    snapshots.clear();
+    childParents.clear();
+    sessionOwners.clear();
+    teamWatchers.clear();
     if (listSubscription) {
       void listSubscription.release().catch(() => undefined);
       listSubscription = null;

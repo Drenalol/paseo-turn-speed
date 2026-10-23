@@ -16,6 +16,10 @@ does report usage.
 Options live under Settings → Plugins → Turn speed: what the pill leads with
 (live estimate, decode-window average, or whole-turn rate, switchable from the
 popover), smoothing window for the live number, token format, idle-pill
-visibility, and a manual chars/token override. Requires Paseo 0.11 or later.
+visibility, and a manual chars/token override. Requires Paseo 0.11 or later;
+see the README for installing from GitHub or npm.
 Turns are observed live; history from before a plugin reload is not
-reconstructed, and subagents get their own pills instead of parent totals.
+reconstructed. Subagents keep their own pills, but the parent also knows about
+them: time delegated to running subagents is excluded from the parent's
+whole-turn rate, its pill grows a `· N sub` badge, and the popover adds a
+per-subagent breakdown with a combined team rate.
