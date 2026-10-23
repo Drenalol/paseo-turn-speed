@@ -21,5 +21,6 @@ see the README for installing from GitHub or npm.
 Turns are observed live; history from before a plugin reload is not
 reconstructed. Subagents keep their own pills, but the parent also knows about
 them: time delegated to running subagents is excluded from the parent's
-whole-turn rate, its pill grows a `· N sub` badge, and the popover adds a
-per-subagent breakdown with a combined team rate.
+whole-turn rate, its pill grows a `· N sub` badge, and for Paseo-native child
+agents the popover adds a per-subagent breakdown with a combined team rate.
+Subagent replies count as the parent's input tokens, never its output.

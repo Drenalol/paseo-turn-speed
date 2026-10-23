@@ -97,13 +97,17 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   separate `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
 - **Delegation to subagents** — while the agent's work runs in subagents, the
   parent's own model produces nothing, so that stretch is removed from its
-  whole-turn rate like a user wait. Delegation is detected from the parent's
-  timeline (`sub_agent` tool details where the provider reports them, and the
+  whole-turn rate like a user wait. A subagent's reply reaching the parent is
+  a tool result: it lands in the parent's *input* tokens (`in`/`cached`),
+  never in its output. Delegation is detected from the parent's timeline
+  (`sub_agent` tool details where the provider reports them, and the
   normalized `subagent` tool calls Paseo emits for provider subagents such as
   OpenCode's Task) and from linked Paseo child agents. The parent's pill grows
-  a `· N sub` badge, its accessible title carries the team's combined tok/s,
-  and the popover lists every subagent with its own live rate and tokens plus a
-  `team` total. Each linked subagent still gets its own pill in its own composer.
+  a `· N sub` badge and its accessible title carries the team rate. For
+  linked Paseo children the popover also lists each subagent with its own
+  live rate and tokens plus a `team` total; for provider subagents only the
+  running count and delegated time are knowable (see Known limitations).
+  Each linked subagent still gets its own pill in its own composer.
 - **Live number inside a model call** — real tokens only arrive at the end of a
   call, so the live value estimates tokens from characters over a 1/2/5 s
   smoothing window and is marked `≈` until the call's usage lands.

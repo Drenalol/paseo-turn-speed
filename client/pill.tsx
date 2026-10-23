@@ -56,19 +56,16 @@ export function computePillView(
   if (phase === "failed") labelParts.push("\u00b7 failed");
   if (phase === "canceled") labelParts.push("\u00b7 canceled");
   const titleParts = [`Turn speed ${rateText} decode`];
-  if (waiting) titleParts.push("waiting for you");
+  if (waiting) titleParts.push("waiting");
   if (teamRunning) {
-    const teamRate = teamRunning.liveTokPerSec;
-    const teamLabel = `${teamRunning.running} subagent${teamRunning.running === 1 ? "" : "s"}`;
-    if (teamRate !== null) {
-      titleParts.push(`${teamLabel} at ${approx(fmtRate(teamRate), teamRunning.approx)} tok/s`);
-    } else if (teamRunning.estTokens > 0) {
-      titleParts.push(
-        `${teamLabel} working (${approx(fmtTokens(teamRunning.estTokens, prefs.tokenFormat), teamRunning.approx)} tok)`,
-      );
-    } else {
-      titleParts.push(`${teamLabel} working`);
-    }
+    // Keep the sheet title on one phone line: the short `N sub` form matches
+    // the pill label; the full breakdown is in the popover body.
+    const teamLabel = `${teamRunning.running} sub`;
+    titleParts.push(
+      teamRunning.liveTokPerSec === null
+        ? teamLabel
+        : `${teamLabel} @ ${approx(fmtRate(teamRunning.liveTokPerSec), teamRunning.approx)} tok/s`,
+    );
   }
   if (summary.estTokens > 0) {
     titleParts.push(`${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), isApprox)} tok`);
