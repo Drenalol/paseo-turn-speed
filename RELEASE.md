@@ -94,3 +94,10 @@ Validation rules the registries enforce (worth keeping either way):
 - 2026-11-02 — paseo.cafe shut down: community listing dropped from the
   release process and from the listings table; its scanner-specific manifest
   restrictions are kept only as history (see Registry conventions).
+- 2026-11-02 — v1.3.0 published: prompt cache hit rate in the pill and
+  popover (PR #1: `showCacheInPill` and `cacheCounting` preferences,
+  auto/inclusive/separate detection), and turn-window reconciliation
+  (PR #2: the clock anchors to the `turn_started` event timestamp, mid-turn
+  attach seeds only after the subscription is ready, and a snapshot closes a
+  turn whose terminal event was lost provisionally). Both PRs were external
+  contributions; the combined tree verified at 98 tests.
