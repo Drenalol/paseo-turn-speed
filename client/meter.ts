@@ -189,6 +189,10 @@ export interface MeterState {
   calibInput: { chars: number; tokens: number } | null;
   endedAt: number | null;
   endNote: string | null;
+  /** Ended from an agent snapshot rather than a terminal event: the clock is
+   * stopped, but the outcome (completed / failed / canceled) is still open and
+   * the real terminal event for this turn may replace it. */
+  provisional: boolean;
 }
 
 export type MeterAction =
@@ -204,7 +208,7 @@ export type MeterAction =
   | { t: "delegated_started"; at: number }
   /** All subagents finished: the agent works alone again. */
   | { t: "delegated_ended"; at: number }
-  | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null }
+  | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null; turnId?: string | null; provisional?: boolean }
   /** The agent switched model (or its identity just became known): a
    * thinking-exclusion verdict learned on another model must not carry. */
   | { t: "model_changed"; model: string | null }
@@ -250,6 +254,7 @@ export function initialMeterState(): MeterState {
     calibInput: null,
     endedAt: null,
     endNote: null,
+    provisional: false,
   };
 }
 
@@ -518,17 +523,34 @@ function endTurn(
   usage: UsageSnapshot | undefined,
   maxTokPerSec: number | undefined,
   note: string | null,
+  turnId: string | null | undefined,
+  provisional: boolean,
 ): MeterState {
   // A repeated cumulative payload contributes no delta and opens no step.
   const withUsage = usage ? applyUsage(state, at, usage, maxTokPerSec) : state;
-  if (withUsage.phase !== "running") return state;
-  // A turn that ends while a question is still open closes the wait there;
-  // same for an ongoing delegation.
+  if (withUsage.phase === "running") {
+    // A turn that ends while a question is still open closes the wait there;
+    // same for an ongoing delegation.
+    return {
+      ...closeDelegated(closeWait(withUsage, at), at),
+      phase: kind,
+      endedAt: at,
+      endNote: note,
+      provisional,
+    };
+  }
+  // A provisional end only knows that the agent stopped working: an idle
+  // snapshot cannot tell a completed turn from a failed or canceled one. The
+  // real terminal event is authoritative for the same turn, so it replaces the
+  // guess together with the outcome and the usage it carries.
+  if (!withUsage.provisional) return state;
+  if (turnId != null && withUsage.turnId !== null && withUsage.turnId !== turnId) return state;
   return {
-    ...closeDelegated(closeWait(withUsage, at), at),
+    ...withUsage,
     phase: kind,
     endedAt: at,
     endNote: note,
+    provisional: false,
   };
 }
 
@@ -593,7 +615,16 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
       // An end for a delegation we never saw is a no-op.
       return state.delegatedAt === null ? state : closeDelegated(state, action.at);
     case "turn_ended":
-      return endTurn(state, action.at, action.kind, action.usage, action.maxTokPerSec, action.note ?? null);
+      return endTurn(
+        state,
+        action.at,
+        action.kind,
+        action.usage,
+        action.maxTokPerSec,
+        action.note ?? null,
+        action.turnId,
+        action.provisional === true,
+      );
     case "reset":
       // Keep the observed usage baseline: the provider's counters outlive the
       // locally observed turn, so deltas must stay continuous.

@@ -5,9 +5,8 @@ import { bindPill } from "./client/pill";
 import { makeSpeedDetails } from "./client/details";
 import { parentAgentIdOf } from "./client/links";
 import {
-  shouldCloseMissedTurn,
+  reconcileSnapshot,
   turnStartFromEvent,
-  turnStartFromSnapshot,
 } from "./client/lifecycle";
 import { summarizeTeam, type TeamMemberInput } from "./client/team";
 import { makeSettingsScreen } from "./client/settings";
@@ -398,60 +397,15 @@ export default function contribute(client: PluginClientContext) {
     // triggered the attach, then from the handle when it is populated.
     observeUsage(agent.lastUsage ?? null);
     observeUsage(handle.lastUsage);
-    // Open permission/question requests: non-empty means the model is
-    // blocked on the user and the meter must not charge that time to it.
+    // Open permission/question requests, tracked so stream events do not
+    // dispatch the same transition twice.
     const pendingWaits = new Set<string>();
-    const syncWaits = (snapshot: {
-      pendingPermissions?: readonly { id: string }[] | null;
-    }): void => {
-      const pending = snapshot.pendingPermissions;
-      if (!pending) return;
-      pendingWaits.clear();
-      for (const request of pending) pendingWaits.add(request.id);
-      store.dispatch({
-        t: pendingWaits.size > 0 ? "user_wait_started" : "user_wait_ended",
-        at: Date.now(),
-      });
-    };
-    syncWaits(agent);
     // Live events are only delivered after the timeline subscription is
     // established, and the daemon keeps no replay: anything that happens
     // before `ready` is invisible. Seeding a turn before then is what leaves
     // a turn that ends inside that window running forever, so seeding waits
     // for `ready` and takes its snapshot afterwards.
     let listening = false;
-    // Attaching mid-turn (agent created before the plugin loaded, or a fresh
-    // agent whose turn_started raced the subscription): start the meter from
-    // the snapshot so the pill exists for the rest of that turn.
-    const seedTurn = (snapshot: {
-      status?: string | null;
-      activeTurn?: { turnId?: string | null; startedAt?: string | null } | null;
-    }): void => {
-      if (!listening) return;
-      if (store.state.phase !== "idle" || snapshot.status !== "running" || !snapshot.activeTurn) return;
-      const start = turnStartFromSnapshot(snapshot.activeTurn.startedAt, Date.now());
-      store.dispatch({
-        t: "turn_started",
-        at: start.at,
-        turnId: snapshot.activeTurn.turnId ?? null,
-      });
-    };
-    // A ref() handle starts empty: without a real snapshot, the first usage
-    // event after a reload would count the session-cumulative counters as
-    // one giant step. Fetch the truth for that case.
-    const reseed = (): void => {
-      void handle
-        .refresh()
-        .then((result) => {
-          const snapshot = result?.agent;
-          if (!snapshot || attached.get(agent.id)?.store !== store) return;
-          store.setIdentity(snapshot.provider, snapshot.model ?? null);
-          observeUsage(snapshot.lastUsage ?? null);
-          syncWaits(snapshot);
-          seedTurn(snapshot);
-        })
-        .catch((error) => logError(`usage reseed failed for ${agent.id}`, error));
-    };
 
     // Delegation: open sub_agent tool calls (or linked children that are
     // running) mean the agent's own model is idle while subagents work, so
@@ -480,6 +434,40 @@ export default function contribute(client: PluginClientContext) {
       console.log(`turn-speed: delegation ${should ? "on" : "off"} [${agent.id.slice(0, 8)}]`);
       store.dispatch({ t: should ? "delegated_started" : "delegated_ended", at: Date.now() });
     };
+    // One snapshot, one ordered set of actions: identify the turn, restore the
+    // waits that belong to it, then end a turn whose terminal event was lost.
+    // The last step is provisional, so a real terminal event still decides the
+    // outcome.
+    function reconcile(snapshot: AgentSnapshot): void {
+      const result = reconcileSnapshot(store.state, snapshot, Date.now(), { seed: listening });
+      if (result.pendingWaits) {
+        pendingWaits.clear();
+        for (const requestId of result.pendingWaits) pendingWaits.add(requestId);
+      }
+      for (const action of result.actions) {
+        store.dispatch(action);
+        if (action.t === "turn_ended" && action.provisional) {
+          subCalls.clear();
+          syncDelegated();
+          void refreshPrefs();
+        }
+      }
+    }
+    // A ref() handle starts empty: without a real snapshot, the first usage
+    // event after a reload would count the session-cumulative counters as
+    // one giant step. Fetch the truth for that case.
+    function reseed(): void {
+      void handle
+        .refresh()
+        .then((result) => {
+          const snapshot = result?.agent;
+          if (!snapshot || attached.get(agent.id)?.store !== store) return;
+          store.setIdentity(snapshot.provider, snapshot.model ?? null);
+          observeUsage(snapshot.lastUsage ?? null);
+          reconcile(snapshot);
+        })
+        .catch((error) => logError(`usage reseed failed for ${agent.id}`, error));
+    }
     const team = () => {
       const view = summarizeTeam(
         teamMembers(agent.id),
@@ -535,18 +523,7 @@ export default function contribute(client: PluginClientContext) {
       remember(snapshot);
       store.setIdentity(snapshot.provider, snapshot.model ?? null);
       observeUsage(snapshot.lastUsage ?? null);
-      syncWaits(snapshot);
-      // A terminal stream event can still be lost after `ready` (reconnect
-      // gap, dropped delivery) and nothing else closes a turn. The snapshot
-      // is the independent source of truth: an agent that is no longer
-      // running ends the meter even when `turn_completed` never arrived.
-      if (shouldCloseMissedTurn(store.state.phase, snapshot.status)) {
-        pendingWaits.clear();
-        subCalls.clear();
-        store.dispatch({ t: "turn_ended", at: Date.now(), kind: "completed" });
-        syncDelegated();
-        void refreshPrefs();
-      }
+      reconcile(snapshot);
       if (snapshot.archivedAt || snapshot.status === "closed") detach(agent.id);
     });
 

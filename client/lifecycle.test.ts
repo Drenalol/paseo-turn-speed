@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { initialMeterState, reduceMeter, type MeterState } from "./meter";
 import {
-  shouldCloseMissedTurn,
+  reconcileSnapshot,
   turnStartFromEvent,
   turnStartFromSnapshot,
+  type AgentTurnSnapshot,
 } from "./lifecycle";
 
 const T0 = Date.parse("2026-11-02T09:12:31.195Z");
+
+/** Fold the reconciled actions the way the plugin dispatches them. */
+function apply(state: MeterState, actions: ReturnType<typeof reconcileSnapshot>["actions"]): MeterState {
+  return actions.reduce(reduceMeter, state);
+}
+
+function runningTurn(at = T0, turnId = "t1"): MeterState {
+  return reduceMeter(initialMeterState(), { t: "turn_started", at, turnId });
+}
+
+function snapshot(overrides: AgentTurnSnapshot = {}): AgentTurnSnapshot {
+  return { status: "running", activeTurn: { turnId: "t1", startedAt: new Date(T0).toISOString() }, ...overrides };
+}
 
 test("event start uses the daemon timestamp carried by the stream message", () => {
   assert.deepEqual(turnStartFromEvent("2026-11-02T09:12:31.195Z", T0 + 3), {
@@ -16,33 +31,25 @@ test("event start uses the daemon timestamp carried by the stream message", () =
 });
 
 test("event start never begins in the future", () => {
-  const start = turnStartFromEvent("2026-11-02T09:12:31.195Z", T0 - 2);
-  assert.equal(start.at, T0 - 2);
+  assert.equal(turnStartFromEvent("2026-11-02T09:12:31.195Z", T0 - 2).at, T0 - 2);
 });
 
-test("event start ignores a timestamp far enough ahead to be a broken clock", () => {
-  // 30s ahead of arrival: unreal, fall back to arrival.
-  assert.deepEqual(turnStartFromEvent("2026-11-02T09:12:31.195Z", T0 - 30_000), {
-    at: T0 - 30_000,
-    source: "arrival",
-  });
-});
-
-test("event start falls back to arrival for a stale or missing timestamp", () => {
-  const arrivedAt = T0 + 120_000;
+test("event start ignores a timestamp too far ahead to be clock skew", () => {
+  const arrivedAt = T0 - 30_000;
   assert.deepEqual(turnStartFromEvent("2026-11-02T09:12:31.195Z", arrivedAt), {
     at: arrivedAt,
     source: "arrival",
   });
-  assert.deepEqual(turnStartFromEvent(null, arrivedAt), { at: arrivedAt, source: "arrival" });
-  assert.deepEqual(turnStartFromEvent("not a date", arrivedAt), {
-    at: arrivedAt,
-    source: "arrival",
-  });
-  assert.deepEqual(turnStartFromEvent(undefined, arrivedAt), {
-    at: arrivedAt,
-    source: "arrival",
-  });
+});
+
+test("event start falls back to arrival when there is no usable timestamp", () => {
+  const arrivedAt = T0 + 120_000;
+  for (const timestamp of [null, undefined, "", "not a date"]) {
+    assert.deepEqual(turnStartFromEvent(timestamp, arrivedAt), {
+      at: arrivedAt,
+      source: "arrival",
+    });
+  }
 });
 
 test("snapshot start anchors a mid-turn attach to the accepted-turn boundary", () => {
@@ -54,10 +61,7 @@ test("snapshot start anchors a mid-turn attach to the accepted-turn boundary", (
 
 test("snapshot start is clamped when the snapshot has no usable timestamp", () => {
   const observedAt = T0 + 2_000;
-  assert.deepEqual(turnStartFromSnapshot(null, observedAt), {
-    at: observedAt,
-    source: "arrival",
-  });
+  assert.deepEqual(turnStartFromSnapshot(null, observedAt), { at: observedAt, source: "arrival" });
   assert.deepEqual(turnStartFromSnapshot("garbage", observedAt), {
     at: observedAt,
     source: "arrival",
@@ -68,23 +72,97 @@ test("snapshot start is clamped when the snapshot has no usable timestamp", () =
   });
 });
 
-test("a missed terminal event is closed by an idle snapshot", () => {
-  assert.equal(shouldCloseMissedTurn("running", "idle"), true);
-  assert.equal(shouldCloseMissedTurn("running", "error"), true);
-  assert.equal(shouldCloseMissedTurn("running", "closed"), true);
-  assert.equal(shouldCloseMissedTurn("running", "initializing"), true);
+test("attaching mid-turn establishes the turn before restoring its wait", () => {
+  const result = reconcileSnapshot(
+    initialMeterState(),
+    snapshot({ pendingPermissions: [{ id: "req-1" }] }),
+    T0 + 2_000,
+    { seed: true },
+  );
+  assert.deepEqual(
+    result.actions.map((action) => action.t),
+    ["turn_started", "user_wait_started"],
+  );
+  const state = apply(initialMeterState(), result.actions);
+  assert.equal(state.phase, "running");
+  assert.equal(state.turnId, "t1");
+  // The pause is attached to the turn, not dropped as "no turn yet".
+  assert.equal(state.pausedAt, T0 + 2_000);
+  assert.deepEqual(result.pendingWaits, ["req-1"]);
 });
 
-test("a running agent keeps the clock, and no turn means nothing to close", () => {
-  assert.equal(shouldCloseMissedTurn("running", "running"), false);
-  assert.equal(shouldCloseMissedTurn("idle", "idle"), false);
-  assert.equal(shouldCloseMissedTurn("completed", "idle"), false);
-  assert.equal(shouldCloseMissedTurn("failed", "idle"), false);
-  assert.equal(shouldCloseMissedTurn("canceled", "idle"), false);
+test("seeding waits for the subscription and only seeds a running snapshot", () => {
+  const beforeReady = reconcileSnapshot(initialMeterState(), snapshot(), T0 + 2_000, { seed: false });
+  assert.deepEqual(beforeReady.actions, []);
+  const idle = reconcileSnapshot(
+    initialMeterState(),
+    snapshot({ status: "idle", activeTurn: null }),
+    T0 + 2_000,
+    { seed: true },
+  );
+  assert.deepEqual(idle.actions, []);
+});
+
+test("an answered permission closes the wait on the running turn", () => {
+  const state = reduceMeter(runningTurn(), { t: "user_wait_started", at: T0 + 1_000 });
+  const result = reconcileSnapshot(state, snapshot({ pendingPermissions: [] }), T0 + 3_000, {
+    seed: true,
+  });
+  assert.deepEqual(result.actions.map((action) => action.t), ["user_wait_ended"]);
+  const next = apply(state, result.actions);
+  assert.equal(next.pausedAt, null);
+  assert.deepEqual(next.userWaits, [{ start: T0 + 1_000, end: T0 + 3_000 }]);
+});
+
+test("a snapshot without wait information leaves the wait alone", () => {
+  const state = reduceMeter(runningTurn(), { t: "user_wait_started", at: T0 + 1_000 });
+  const result = reconcileSnapshot(state, snapshot(), T0 + 3_000, { seed: true });
+  assert.deepEqual(result.actions, []);
+  assert.equal(result.pendingWaits, null);
+});
+
+test("a turn whose terminal event was lost is closed provisionally", () => {
+  const state = reduceMeter(runningTurn(), { t: "text", at: T0 + 500, key: "m", text: "hi" });
+  const result = reconcileSnapshot(
+    state,
+    { status: "idle", activeTurn: null },
+    T0 + 4_000,
+    { seed: true },
+  );
+  assert.deepEqual(result.actions, [
+    { t: "turn_ended", at: T0 + 4_000, kind: "completed", turnId: "t1", provisional: true },
+  ]);
+  const next = apply(state, result.actions);
+  assert.equal(next.phase, "completed");
+  assert.equal(next.provisional, true);
+  assert.equal(next.endedAt, T0 + 4_000);
+});
+
+test("a running agent keeps its clock, and an idle meter has nothing to close", () => {
+  assert.deepEqual(reconcileSnapshot(runningTurn(), snapshot(), T0 + 4_000, { seed: true }).actions, []);
+  assert.deepEqual(
+    reconcileSnapshot(initialMeterState(), { status: "idle", activeTurn: null }, T0, { seed: true })
+      .actions,
+    [],
+  );
+});
+
+test("a snapshot describing another turn never closes this one", () => {
+  const result = reconcileSnapshot(
+    runningTurn(T0, "t1"),
+    { status: "idle", activeTurn: { turnId: "t2", startedAt: null } },
+    T0 + 4_000,
+    { seed: true },
+  );
+  assert.deepEqual(result.actions, []);
 });
 
 test("a partial snapshot without a status never closes a turn", () => {
-  assert.equal(shouldCloseMissedTurn("running", null), false);
-  assert.equal(shouldCloseMissedTurn("running", undefined), false);
-  assert.equal(shouldCloseMissedTurn("running", ""), false);
+  for (const status of [null, undefined, ""]) {
+    assert.deepEqual(
+      reconcileSnapshot(runningTurn(), { status, activeTurn: null }, T0 + 4_000, { seed: true })
+        .actions,
+      [],
+    );
+  }
 });
