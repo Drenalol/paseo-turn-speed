@@ -166,3 +166,16 @@ test("a partial snapshot without a status never closes a turn", () => {
     );
   }
 });
+
+test("a seeded turn parks the delegation of children that are already running", () => {
+  // The parent attaches after its children: the snapshot establishes the turn,
+  // and the delegation that follows it is parked instead of charged as work.
+  const result = reconcileSnapshot(initialMeterState(), snapshot(), T0 + 2_000, { seed: true });
+  let state = apply(initialMeterState(), result.actions);
+  state = reduceMeter(state, { t: "delegated_started", at: T0 + 2_000 });
+  assert.equal(state.delegatedAt, T0 + 2_000);
+  // Delegation before the turn exists is a no-op, which is why the order
+  // matters: the reconciliation has to establish the turn first.
+  const early = reduceMeter(initialMeterState(), { t: "delegated_started", at: T0 + 2_000 });
+  assert.equal(early.delegatedAt, null);
+});

@@ -475,10 +475,15 @@ export default function contribute(client: PluginClientContext) {
         store.dispatch(action);
         if (action.t === "turn_ended" && action.provisional) {
           subCalls.clear();
-          syncDelegated();
           void refreshPrefs();
         }
       }
+      // Re-evaluate the delegation after the snapshot: it may have just
+      // established the turn, and children that are already running must park
+      // that time instead of charging it to the parent. Without this, a parent
+      // that attaches after its children would count their work as its own
+      // until the next child event.
+      syncDelegated();
     }
     // A ref() handle starts empty: without a real snapshot, the first usage
     // event after a reload would count the session-cumulative counters as
