@@ -516,6 +516,25 @@ function applyUsage(
   };
 }
 
+/** A provisional end stopped the clock, but the step it froze still belongs
+ * to this turn: usage that arrives afterwards must still close that step, or
+ * the terminal payload's tokens never reach the turn's totals. */
+function usageAccountingBase(state: MeterState): MeterState {
+  return state.provisional ? { ...state, phase: "running" } : state;
+}
+
+/** Keep the stopped clock when only the accounting was updated. */
+function keepProvisionalEnd(state: MeterState, next: MeterState): MeterState {
+  if (!state.provisional) return next;
+  return {
+    ...next,
+    phase: state.phase,
+    endedAt: state.endedAt,
+    endNote: state.endNote,
+    provisional: true,
+  };
+}
+
 function endTurn(
   state: MeterState,
   at: number,
@@ -526,8 +545,14 @@ function endTurn(
   turnId: string | null | undefined,
   provisional: boolean,
 ): MeterState {
+  // A terminal event for another turn describes a turn this meter never
+  // followed: it must not close this one, and it must not advance this turn's
+  // usage baseline either.
+  if (turnId != null && state.turnId != null && turnId !== state.turnId) return state;
   // A repeated cumulative payload contributes no delta and opens no step.
-  const withUsage = usage ? applyUsage(state, at, usage, maxTokPerSec) : state;
+  const withUsage = usage
+    ? applyUsage(usageAccountingBase(state), at, usage, maxTokPerSec)
+    : state;
   if (withUsage.phase === "running") {
     // A turn that ends while a question is still open closes the wait there;
     // same for an ongoing delegation.
@@ -544,7 +569,6 @@ function endTurn(
   // real terminal event is authoritative for the same turn, so it replaces the
   // guess together with the outcome and the usage it carries.
   if (!withUsage.provisional) return state;
-  if (turnId != null && withUsage.turnId !== null && withUsage.turnId !== turnId) return state;
   return {
     ...withUsage,
     phase: kind,
@@ -592,8 +616,15 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
           // Backwards compatibility with callers using the legacy key scheme.
           (action.kind === undefined && action.key.startsWith("reasoning")),
       );
-    case "usage":
-      return applyUsage(state, action.at, action.usage, action.maxTokPerSec);
+    case "usage": {
+      const next = applyUsage(
+        usageAccountingBase(state),
+        action.at,
+        action.usage,
+        action.maxTokPerSec,
+      );
+      return keepProvisionalEnd(state, next);
+    }
     case "compaction":
       // Context was rewritten; streamed chars since the last step no longer
       // map to answer tokens. Drop the live window, keep step history.

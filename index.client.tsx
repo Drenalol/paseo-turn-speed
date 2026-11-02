@@ -66,6 +66,17 @@ export default function contribute(client: PluginClientContext) {
   const logError = (...args: unknown[]) => {
     if (!aborted()) console.error("turn-speed:", ...args);
   };
+  /** A terminal event for a turn this meter never followed (its start was
+   * lost) must not close the current turn, replace its outcome, or clear the
+   * waits and tool calls that belong to it. */
+  const belongsToCurrentTurn = (
+    store: AgentSpeedStore,
+    turnId: string | null | undefined,
+  ): boolean => {
+    if (!turnId) return true;
+    const current = store.state.turnId;
+    return current === null || current === turnId;
+  };
 
   const notifyTeam = (parentId: string): void => {
     for (const listener of teamWatchers.get(parentId) ?? []) {
@@ -261,12 +272,14 @@ export default function contribute(client: PluginClientContext) {
         break;
       }
       case "turn_completed":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
           kind: "completed",
+          turnId: event.turnId ?? null,
           usage: event.usage ? mapUsage(event.usage) : undefined,
           maxTokPerSec: prefs.maxPlausibleTokPerSec,
         });
@@ -274,15 +287,29 @@ export default function contribute(client: PluginClientContext) {
         void refreshPrefs();
         break;
       case "turn_failed":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
-        store.dispatch({ t: "turn_ended", at, kind: "failed", note: event.error });
+        store.dispatch({
+          t: "turn_ended",
+          at,
+          kind: "failed",
+          turnId: event.turnId ?? null,
+          note: event.error,
+        });
         onSubChange();
         break;
       case "turn_canceled":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
-        store.dispatch({ t: "turn_ended", at, kind: "canceled", note: event.reason });
+        store.dispatch({
+          t: "turn_ended",
+          at,
+          kind: "canceled",
+          turnId: event.turnId ?? null,
+          note: event.reason,
+        });
         onSubChange();
         break;
       case "permission_requested":
