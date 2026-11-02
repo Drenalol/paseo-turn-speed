@@ -547,8 +547,9 @@ function endTurn(
 ): MeterState {
   // A terminal event for another turn describes a turn this meter never
   // followed: it must not close this one, and it must not advance this turn's
-  // usage baseline either.
-  if (turnId != null && state.turnId != null && turnId !== state.turnId) return state;
+  // usage baseline either. An empty id is no id, not another turn.
+  const id = turnId || null;
+  if (id !== null && state.turnId !== null && id !== state.turnId) return state;
   // A repeated cumulative payload contributes no delta and opens no step.
   const withUsage = usage
     ? applyUsage(usageAccountingBase(state), at, usage, maxTokPerSec)
@@ -587,7 +588,7 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
       return {
         ...initialMeterState(),
         phase: "running",
-        turnId: action.turnId,
+        turnId: action.turnId || null,
         startedAt: action.at,
         ctxMax: state.ctxMax,
         ctxUsed: state.ctxUsed,

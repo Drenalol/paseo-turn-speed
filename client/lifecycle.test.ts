@@ -179,3 +179,15 @@ test("a seeded turn parks the delegation of children that are already running", 
   const early = reduceMeter(initialMeterState(), { t: "delegated_started", at: T0 + 2_000 });
   assert.equal(early.delegatedAt, null);
 });
+
+test("an empty turn id in a snapshot is no id", () => {
+  const result = reconcileSnapshot(
+    initialMeterState(),
+    { status: "running", activeTurn: { turnId: "", startedAt: new Date(T0).toISOString() } },
+    T0 + 2_000,
+    { seed: true },
+  );
+  assert.deepEqual(result.actions, [
+    { t: "turn_started", at: T0, turnId: null },
+  ]);
+});

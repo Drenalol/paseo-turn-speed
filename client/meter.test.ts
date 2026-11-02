@@ -794,3 +794,17 @@ test("the terminal payload repeats no token after the usage already landed", () 
   assert.equal(s.steps[0].outTokens, 40);
   assert.equal(s.provisional, false);
 });
+
+test("an empty turn id is no id, not another turn", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  // The terminal carries no usable id: it must still close this turn.
+  const after = reduceMeter(s, { t: "turn_ended", at: 1200, kind: "failed", turnId: "" });
+  assert.equal(after.phase, "failed");
+  assert.equal(after.endedAt, 1200);
+});
+
+test("an empty turn id on the start is stored as no id", () => {
+  const s = reduceMeter(initialMeterState(), { t: "turn_started", at: 0, turnId: "" });
+  assert.equal(s.turnId, null);
+});

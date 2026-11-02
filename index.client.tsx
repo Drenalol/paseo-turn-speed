@@ -68,14 +68,16 @@ export default function contribute(client: PluginClientContext) {
   };
   /** A terminal event for a turn this meter never followed (its start was
    * lost) must not close the current turn, replace its outcome, or clear the
-   * waits and tool calls that belong to it. */
+   * waits and tool calls that belong to it. An empty id is no id: the reducer
+   * treats it the same way. */
   const belongsToCurrentTurn = (
     store: AgentSpeedStore,
     turnId: string | null | undefined,
   ): boolean => {
-    if (!turnId) return true;
+    const id = turnId || null;
+    if (id === null) return true;
     const current = store.state.turnId;
-    return current === null || current === turnId;
+    return current === null || current === id;
   };
 
   const notifyTeam = (parentId: string): void => {
@@ -266,7 +268,7 @@ export default function contribute(client: PluginClientContext) {
         store.dispatch({
           t: "turn_started",
           at: start.at,
-          turnId: event.turnId ?? null,
+          turnId: event.turnId || null,
         });
         onSubChange();
         break;
@@ -279,7 +281,7 @@ export default function contribute(client: PluginClientContext) {
           t: "turn_ended",
           at,
           kind: "completed",
-          turnId: event.turnId ?? null,
+          turnId: event.turnId || null,
           usage: event.usage ? mapUsage(event.usage) : undefined,
           maxTokPerSec: prefs.maxPlausibleTokPerSec,
         });
@@ -294,7 +296,7 @@ export default function contribute(client: PluginClientContext) {
           t: "turn_ended",
           at,
           kind: "failed",
-          turnId: event.turnId ?? null,
+          turnId: event.turnId || null,
           note: event.error,
         });
         onSubChange();
@@ -307,7 +309,7 @@ export default function contribute(client: PluginClientContext) {
           t: "turn_ended",
           at,
           kind: "canceled",
-          turnId: event.turnId ?? null,
+          turnId: event.turnId || null,
           note: event.reason,
         });
         onSubChange();

@@ -108,7 +108,7 @@ export function reconcileSnapshot(
     push({
       t: "turn_started",
       at: start.at,
-      turnId: snapshot.activeTurn.turnId ?? null,
+      turnId: snapshot.activeTurn.turnId || null,
     });
   }
 
@@ -144,6 +144,6 @@ export function shouldCloseMissedTurn(
   if (state.phase !== "running") return false;
   const status = snapshot.status;
   if (typeof status !== "string" || status === "" || status === "running") return false;
-  const turnId = snapshot.activeTurn?.turnId ?? null;
+  const turnId = snapshot.activeTurn?.turnId || null;
   return turnId === null || state.turnId === null || turnId === state.turnId;
 }
