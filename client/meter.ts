@@ -83,7 +83,18 @@ export const INCLUSION_EVIDENCE_STEPS = 3;
 
 export interface UsageSnapshot {
   input?: number | null;
+  /** Prompt tokens served from the provider's cache (cache reads). */
   cached?: number | null;
+  /**
+   * Prompt tokens written into the provider's cache (Anthropic's
+   * `cache_creation_input_tokens`). Part of the prompt the model had to
+   * process, so it belongs in the cache-hit denominator.
+   *
+   * Paseo's AgentUsage carries no such field today (see the note on
+   * `PromptTotals`), so the client always sends 0; the slot exists so a
+   * provider that starts reporting it changes one mapper, not the formula.
+   */
+  cacheWrite?: number | null;
   output?: number | null;
   ctxMax?: number | null;
   ctxUsed?: number | null;
@@ -107,6 +118,8 @@ export interface StepRecord {
    * window never saw. Their tokens count in turn totals but not in the
    * decode-window rate. */
   thinkingLateChars: number;
+  /** Prompt tokens this call wrote into the cache; 0 when unreported. */
+  cacheWriteTokens: number;
   /** Prefill/TTFT measured on the first step only, else 0. */
   prefillMs: number;
 }
@@ -150,6 +163,7 @@ export interface MeterState {
   prevUsageOut: number;
   prevUsageIn: number;
   prevUsageCached: number;
+  prevUsageCacheWrite: number;
   steps: readonly StepRecord[];
   /** Characters streamed since the last step boundary (live estimate). */
   liveChars: number;
@@ -189,6 +203,10 @@ export interface MeterState {
   calibInput: { chars: number; tokens: number } | null;
   endedAt: number | null;
   endNote: string | null;
+  /** Ended from an agent snapshot rather than a terminal event: the clock is
+   * stopped, but the outcome (completed / failed / canceled) is still open and
+   * the real terminal event for this turn may replace it. */
+  provisional: boolean;
 }
 
 export type MeterAction =
@@ -204,7 +222,7 @@ export type MeterAction =
   | { t: "delegated_started"; at: number }
   /** All subagents finished: the agent works alone again. */
   | { t: "delegated_ended"; at: number }
-  | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null }
+  | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null; turnId?: string | null; provisional?: boolean }
   /** The agent switched model (or its identity just became known): a
    * thinking-exclusion verdict learned on another model must not carry. */
   | { t: "model_changed"; model: string | null }
@@ -232,6 +250,7 @@ export function initialMeterState(): MeterState {
     prevUsageOut: 0,
     prevUsageIn: 0,
     prevUsageCached: 0,
+    prevUsageCacheWrite: 0,
     steps: [],
     liveChars: 0,
     totalChars: 0,
@@ -250,6 +269,7 @@ export function initialMeterState(): MeterState {
     calibInput: null,
     endedAt: null,
     endNote: null,
+    provisional: false,
   };
 }
 
@@ -402,6 +422,7 @@ function applyUsage(
   const out = num(usage.output);
   const inp = num(usage.input);
   const cached = num(usage.cached);
+  const cacheWrite = num(usage.cacheWrite);
   const counters = {
     usageOut: out ?? state.usageOut,
     usageIn: inp ?? state.usageIn,
@@ -412,12 +433,14 @@ function applyUsage(
   const outDelta = delta(out, state.prevUsageOut);
   const inDelta = delta(inp, state.prevUsageIn);
   const cachedDelta = delta(cached, state.prevUsageCached);
+  const cacheWriteDelta = delta(cacheWrite, state.prevUsageCacheWrite);
   const withCounters: MeterState = {
     ...state,
     ...counters,
     prevUsageOut: outDelta.next,
     prevUsageIn: inDelta.next,
     prevUsageCached: cachedDelta.next,
+    prevUsageCacheWrite: cacheWriteDelta.next,
   };
   if (state.phase !== "running") return { ...withCounters };
   if (outDelta.amount <= 0) {
@@ -470,6 +493,7 @@ function applyUsage(
     cachedTokens: cachedDelta.amount,
     thinkingChars: state.liveReasoningChars,
     thinkingLateChars: reasoningLate ? state.liveReasoningChars : 0,
+    cacheWriteTokens: cacheWriteDelta.amount,
     prefillMs,
   };
   // More streamed reasoning characters than this step's output tokens could
@@ -511,6 +535,25 @@ function applyUsage(
   };
 }
 
+/** A provisional end stopped the clock, but the step it froze still belongs
+ * to this turn: usage that arrives afterwards must still close that step, or
+ * the terminal payload's tokens never reach the turn's totals. */
+function usageAccountingBase(state: MeterState): MeterState {
+  return state.provisional ? { ...state, phase: "running" } : state;
+}
+
+/** Keep the stopped clock when only the accounting was updated. */
+function keepProvisionalEnd(state: MeterState, next: MeterState): MeterState {
+  if (!state.provisional) return next;
+  return {
+    ...next,
+    phase: state.phase,
+    endedAt: state.endedAt,
+    endNote: state.endNote,
+    provisional: true,
+  };
+}
+
 function endTurn(
   state: MeterState,
   at: number,
@@ -518,17 +561,40 @@ function endTurn(
   usage: UsageSnapshot | undefined,
   maxTokPerSec: number | undefined,
   note: string | null,
+  turnId: string | null | undefined,
+  provisional: boolean,
 ): MeterState {
+  // A terminal event for another turn describes a turn this meter never
+  // followed: it must not close this one, and it must not advance this turn's
+  // usage baseline either. An empty id is no id, not another turn.
+  const id = turnId || null;
+  if (id !== null && state.turnId !== null && id !== state.turnId) return state;
   // A repeated cumulative payload contributes no delta and opens no step.
-  const withUsage = usage ? applyUsage(state, at, usage, maxTokPerSec) : state;
-  if (withUsage.phase !== "running") return state;
-  // A turn that ends while a question is still open closes the wait there;
-  // same for an ongoing delegation.
+  const withUsage = usage
+    ? applyUsage(usageAccountingBase(state), at, usage, maxTokPerSec)
+    : state;
+  if (withUsage.phase === "running") {
+    // A turn that ends while a question is still open closes the wait there;
+    // same for an ongoing delegation.
+    return {
+      ...closeDelegated(closeWait(withUsage, at), at),
+      phase: kind,
+      endedAt: at,
+      endNote: note,
+      provisional,
+    };
+  }
+  // A provisional end only knows that the agent stopped working: an idle
+  // snapshot cannot tell a completed turn from a failed or canceled one. The
+  // real terminal event is authoritative for the same turn, so it replaces the
+  // guess together with the outcome and the usage it carries.
+  if (!withUsage.provisional) return state;
   return {
-    ...closeDelegated(closeWait(withUsage, at), at),
+    ...withUsage,
     phase: kind,
     endedAt: at,
     endNote: note,
+    provisional: false,
   };
 }
 
@@ -541,7 +607,7 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
       return {
         ...initialMeterState(),
         phase: "running",
-        turnId: action.turnId,
+        turnId: action.turnId || null,
         startedAt: action.at,
         ctxMax: state.ctxMax,
         ctxUsed: state.ctxUsed,
@@ -550,6 +616,7 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
         prevUsageOut: state.prevUsageOut,
         prevUsageIn: state.prevUsageIn,
         prevUsageCached: state.prevUsageCached,
+        prevUsageCacheWrite: state.prevUsageCacheWrite,
         // A provider-level property: survives turns like the usage baseline
         // — but only when it has a known owner. A verdict that never got a
         // model identity cannot tell an unchanged provider from an invisible
@@ -570,8 +637,15 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
           // Backwards compatibility with callers using the legacy key scheme.
           (action.kind === undefined && action.key.startsWith("reasoning")),
       );
-    case "usage":
-      return applyUsage(state, action.at, action.usage, action.maxTokPerSec);
+    case "usage": {
+      const next = applyUsage(
+        usageAccountingBase(state),
+        action.at,
+        action.usage,
+        action.maxTokPerSec,
+      );
+      return keepProvisionalEnd(state, next);
+    }
     case "compaction":
       // Context was rewritten; streamed chars since the last step no longer
       // map to answer tokens. Drop the live window, keep step history.
@@ -593,7 +667,16 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
       // An end for a delegation we never saw is a no-op.
       return state.delegatedAt === null ? state : closeDelegated(state, action.at);
     case "turn_ended":
-      return endTurn(state, action.at, action.kind, action.usage, action.maxTokPerSec, action.note ?? null);
+      return endTurn(
+        state,
+        action.at,
+        action.kind,
+        action.usage,
+        action.maxTokPerSec,
+        action.note ?? null,
+        action.turnId,
+        action.provisional === true,
+      );
     case "reset":
       // Keep the observed usage baseline: the provider's counters outlive the
       // locally observed turn, so deltas must stay continuous.
@@ -605,6 +688,7 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
         prevUsageOut: state.prevUsageOut,
         prevUsageIn: state.prevUsageIn,
         prevUsageCached: state.prevUsageCached,
+        prevUsageCacheWrite: state.prevUsageCacheWrite,
         thinkingExcluded: state.thinkingExcluded,
         thinkingExcludedModel: state.thinkingExcludedModel,
         inclusionStreak: state.inclusionStreak,
@@ -666,6 +750,12 @@ export interface TurnSummary {
   inputTokens: number;
   /** Cached prompt tokens across the turn's calls. */
   cachedTokens: number;
+  /** Prompt tokens written to the cache; 0 for providers that do not report it. */
+  cacheWriteTokens: number;
+  /** All prompt tokens across the turn's calls: input + writes + reads. */
+  promptTokens: number;
+  /** Cached share of `promptTokens` (0..1); null without prompt data. */
+  cacheHitRate: number | null;
   /** Prompt tokens of the first step, for the prefill rate. */
   firstStepPromptTokens: number | null;
   /** Cached prompt tokens of the first step: with a warm cache the prompt
@@ -678,10 +768,69 @@ export interface TurnSummary {
   unattributedTokens: number;
 }
 
-export function summarizeTurn(state: MeterState, charsPerToken: number, now: number): TurnSummary {
+/**
+ * How a provider reports prompt cache reads. The two common shapes cannot be
+ * told apart from the numbers alone, hence the explicit override.
+ *
+ * - `inclusive` (OpenAI-style): the prompt counter already contains the cached
+ *   tokens, so the prompt total is `inputTokens`.
+ * - `separate` (Anthropic-style): `inputTokens` is only the uncached part and
+ *   cache reads are reported on top, so the total is their sum.
+ * - `auto`: infer per turn — cache reads larger than the prompt can only mean
+ *   separate counters; otherwise assume the prompt already includes them.
+ */
+export type CacheCountingMode = "auto" | "inclusive" | "separate";
+
+/**
+ * Prompt totals for one model call.
+ *
+ * The hit rate is the share of the prompt that was served without being
+ * recomputed, so the denominator is the whole prompt:
+ *
+ *     hitRate = cacheRead / (newInput + cacheWrite + cacheRead)
+ *
+ * The `cacheWrite` term is Anthropic's `cache_creation_input_tokens`: those
+ * tokens were part of the prompt even though they missed the cache, and
+ * leaving them out inflates the rate whenever a TTL cache is being rebuilt.
+ * Paseo's `AgentUsage` exposes only `inputTokens` and `cachedInputTokens`, so
+ * the term is always 0 today and the formula collapses to
+ * `cacheRead / (newInput + cacheRead)` — identical to the pre-cache-write
+ * behaviour for every provider that does report 0.
+ *
+ * `hitRate` never exceeds 1: some providers fold cache writes into the same
+ * counter they report as cache reads, and the clamp keeps that from printing
+ * above 100%.
+ */
+export function cacheStats(
+  inputTokens: number,
+  cachedTokens: number,
+  mode: CacheCountingMode = "auto",
+  cacheWriteTokens = 0,
+): { promptTokens: number; cachedTokens: number; hitRate: number | null } {
+  const cached = Number.isFinite(cachedTokens) && cachedTokens > 0 ? cachedTokens : 0;
+  const input = Number.isFinite(inputTokens) && inputTokens > 0 ? inputTokens : 0;
+  const cacheWrite =
+    Number.isFinite(cacheWriteTokens) && cacheWriteTokens > 0 ? cacheWriteTokens : 0;
+  const separate = mode === "separate" || (mode === "auto" && cached > input);
+  const promptTokens = separate ? input + cacheWrite + cached : input + cacheWrite;
+  if (promptTokens <= 0) return { promptTokens: 0, cachedTokens: 0, hitRate: null };
+  return {
+    promptTokens,
+    cachedTokens: cached,
+    hitRate: Math.min(1, cached / promptTokens),
+  };
+}
+
+export function summarizeTurn(
+  state: MeterState,
+  charsPerToken: number,
+  now: number,
+  cacheCounting: CacheCountingMode = "auto",
+): TurnSummary {
   const realOut = state.steps.reduce((sum, s) => sum + s.outTokens, 0);
   const inputTokens = state.steps.reduce((sum, s) => sum + s.inputTokens, 0);
   const cachedTokens = state.steps.reduce((sum, s) => sum + s.cachedTokens, 0);
+  const cacheWriteTokens = state.steps.reduce((sum, s) => sum + s.cacheWriteTokens, 0);
   const waitMs = state.steps.reduce((sum, s) => sum + s.waitMs, 0);
   const hasReal = state.sawUsage && realOut > 0;
   // Without any usage step there is no anchored window; the span of streamed
@@ -775,6 +924,16 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
     decodeMs > 0 && decodeTokens > 0 ? decodeTokens / (decodeMs / 1000) : null;
   const tokPerSecTurn =
     activeMs !== null && activeMs > 0 && estTokens > 0 ? estTokens / (activeMs / 1000) : null;
+  // Each call is normalised on its own, then summed: a turn can mix providers'
+  // shapes, and a per-call decision is far more reliable than a merged one.
+  let promptTokens = 0;
+  let hitTokens = 0;
+  for (const step of state.steps) {
+    const stepCache = cacheStats(step.inputTokens, step.cachedTokens, cacheCounting, step.cacheWriteTokens);
+    promptTokens += stepCache.promptTokens;
+    hitTokens += stepCache.cachedTokens;
+  }
+  const cacheHitRate = promptTokens > 0 ? Math.min(1, hitTokens / promptTokens) : null;
   return {
     outTokens,
     estTokens,
@@ -792,6 +951,9 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
     steps: state.steps.length,
     inputTokens,
     cachedTokens,
+    cacheWriteTokens,
+    promptTokens,
+    cacheHitRate,
     firstStepPromptTokens: state.steps.length > 0 && state.steps[0].inputTokens > 0 ? state.steps[0].inputTokens : null,
     firstStepCachedTokens: state.steps.length > 0 && state.steps[0].cachedTokens > 0 ? state.steps[0].cachedTokens : null,
     thinkingTokens,

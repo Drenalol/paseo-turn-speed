@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  cacheStats,
   calibrate,
   initialMeterState,
   reduceMeter,
@@ -324,6 +325,127 @@ test("text keys survive turn boundaries", () => {
   assert.equal(s.totalChars, 1);
 });
 
+test("cache hit rate uses reported cache reads", () => {
+  // OpenAI-style: `input` already contains the cached tokens.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, input: 10_000, cached: 8_000 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.inputTokens, 10_000);
+  assert.equal(sum.cachedTokens, 8_000);
+  assert.equal(sum.promptTokens, 10_000);
+  assert.equal(sum.cacheHitRate, 0.8);
+});
+
+test("cache hit rate is null without prompt data and 0 without cache", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40 } });
+  assert.equal(summarizeTurn(s, CPT, 1000).cacheHitRate, null);
+  s = reduceMeter(s, { t: "text", at: 1100, key: "m2", text: "b" });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 70, input: 900, cached: 0 } });
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.promptTokens, 900);
+  assert.equal(sum.cacheHitRate, 0);
+});
+
+test("cacheStats separates the two provider prompt shapes", () => {
+  // OpenAI-style: prompt total equals input.
+  assert.deepEqual(cacheStats(1000, 400), { promptTokens: 1000, cachedTokens: 400, hitRate: 0.4 });
+  // Anthropic-style: `input` is the uncached prompt, cache reads are extra.
+  assert.deepEqual(cacheStats(1000, 9000), { promptTokens: 10_000, cachedTokens: 9000, hitRate: 0.9 });
+  // Nothing reported.
+  assert.deepEqual(cacheStats(0, 0), { promptTokens: 0, cachedTokens: 0, hitRate: null });
+  assert.deepEqual(cacheStats(Number.NaN, 500), { promptTokens: 500, cachedTokens: 500, hitRate: 1 });
+});
+
+test("cache writes join the prompt total, so they lower the hit rate", () => {
+  // The Anthropic definition: cacheRead / (newInput + cacheWrite + cacheRead).
+  // Half the prompt is served from cache, half is being written into it.
+  const half = cacheStats(1200, 60_000, "separate", 60_000);
+  assert.equal(half.promptTokens, 121_200);
+  assert.equal(half.cachedTokens, 60_000);
+  assert.equal(half.hitRate, 60_000 / 121_200);
+  assert.ok(half.hitRate !== null && half.hitRate < 0.5);
+
+  // A TTL rebuild that hits nothing: the old formula called this 0% by luck
+  // (cached = 0), the new one keeps 0% for the right reason.
+  const rebuild = cacheStats(1200, 0, "auto", 120_000);
+  assert.equal(rebuild.promptTokens, 121_200);
+  assert.equal(rebuild.hitRate, 0);
+});
+
+test("a zero cache write leaves the rate exactly as before", () => {
+  // Every provider Paseo reports today is in this branch, so the extra term
+  // must not move any number.
+  const withoutTerm = cacheStats(194, 125_056);
+  const withZeroTerm = cacheStats(194, 125_056, "auto", 0);
+  assert.deepEqual(withZeroTerm, withoutTerm);
+  assert.equal(withZeroTerm.promptTokens, 125_250);
+});
+
+test("cache hit rate stays null when the turn reports no prompt at all", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, cacheWrite: 9000 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.cacheWriteTokens, 9000);
+  assert.equal(sum.promptTokens, 9000);
+  assert.equal(sum.cacheHitRate, 0);
+});
+
+test("cache writes accumulate per step like the other counters", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 0, cacheWrite: 50_000 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 1200, cached: 51_000, cacheWrite: 50_000 } });
+  const sum = summarizeTurn(s, CPT, 1800);
+  // Step 2: 1200 new prompt tokens, 51000 cache reads, no new writes.
+  assert.equal(sum.cacheWriteTokens, 50_000);
+  assert.equal(sum.cachedTokens, 51_000);
+  assert.equal(sum.promptTokens, 1200 + 50_000 + 51_000);
+  assert.equal(sum.cacheHitRate, 51_000 / 102_200);
+});
+
+test("cache hit rate accumulates across a turn's steps", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 400 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  // Step 2 brings 1200 fresh prompt tokens and 1200 more cache reads.
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 2200, cached: 1600 } });
+  const sum = summarizeTurn(s, CPT, 1800);
+  assert.equal(sum.inputTokens, 2200);
+  assert.equal(sum.cachedTokens, 1600);
+  assert.equal(sum.promptTokens, 2200);
+  assert.equal(sum.cacheHitRate, 1600 / 2200);
+});
+
+test("a cache read larger than the prompt means disjoint counters", () => {
+  // Anthropic-style providers report cache reads outside `inputTokens`.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, input: 900, cached: 9_100 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.inputTokens, 900);
+  assert.equal(sum.cachedTokens, 9_100);
+  assert.equal(sum.promptTokens, 10_000);
+  assert.equal(sum.cacheHitRate, 0.91);
+});
+
+test("repeated snapshots never inflate the cache hit rate", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 900 } });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 10, input: 1000, cached: 900 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.cachedTokens, 900);
+  assert.equal(sum.promptTokens, 1000);
+  assert.equal(sum.cacheHitRate, 0.9);
+});
+
 test("calibration blends with EMA 0.7/0.3, clamps, and rejects thin samples", () => {
   const first = calibrate(undefined, 800, 100); // 0.7*3.6 + 0.3*8
   assert.equal(first, 4.92);
@@ -642,4 +764,169 @@ test("reasoning and visible characters are estimated with their own ratios", () 
   const liveVisible = 40 / CPT;
   assert.equal(sum.thinkingTokens, closedThinking + liveThinking);
   assert.equal(sum.estTokens, 10 + closedThinking + liveVisible + liveThinking);
+});
+
+test("a provisional end still lets the real terminal event decide the outcome", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1000,
+    kind: "completed",
+    turnId: "t1",
+    provisional: true,
+  });
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, true);
+  assert.equal(s.endedAt, 1000);
+  // The agent snapshot only knew that work stopped; the failure still lands.
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "failed", note: "boom", turnId: "t1" });
+  assert.equal(s.phase, "failed");
+  assert.equal(s.endNote, "boom");
+  assert.equal(s.endedAt, 1100);
+  assert.equal(s.provisional, false);
+});
+
+test("a provisional end is replaced by a completed terminal with its usage", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "completed",
+    turnId: "t1",
+    usage: { output: 40, input: 10 },
+  });
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, false);
+  assert.equal(s.endedAt, 1200);
+  // The terminal payload still refreshes the counters and their baseline.
+  assert.equal(s.usageOut, 40);
+  assert.equal(s.prevUsageOut, 40);
+});
+
+test("a terminal for another turn cannot rewrite a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  const after = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "failed", turnId: "t2" });
+  assert.equal(after, s);
+});
+
+test("a real terminal event is not rewritten by a later duplicate", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "failed", note: "boom", turnId: "t1" });
+  const after = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1" });
+  assert.equal(after, s);
+});
+
+test("the next turn clears a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "turn_started", at: 2000, turnId: "t2" });
+  assert.equal(s.phase, "running");
+  assert.equal(s.turnId, "t2");
+  assert.equal(s.provisional, false);
+  assert.equal(s.endedAt, null);
+});
+
+test("a terminal event for another turn neither closes this turn nor advances its baseline", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  const after = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "failed",
+    turnId: "other",
+    usage: { output: 40 },
+  });
+  assert.equal(after, s);
+  assert.equal(after.phase, "running");
+  assert.equal(after.prevUsageOut, 0);
+});
+
+test("a terminal event for another turn cannot rewrite a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  const after = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "failed",
+    turnId: "other",
+    note: "not this turn",
+  });
+  assert.equal(after, s);
+  assert.equal(after.phase, "completed");
+  assert.equal(after.endNote, null);
+});
+
+test("a provisional end still accounts the terminal usage into the turn", () => {
+  const direct = reduceMeter(
+    reduceMeter(startTurn(initialMeterState(), 0), {
+      t: "text",
+      at: 1000,
+      key: "m1",
+      text: "x".repeat(400),
+    }),
+    { t: "turn_ended", at: 1200, kind: "completed", turnId: "t1", usage: { output: 40, input: 10 } },
+  );
+
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "completed",
+    turnId: "t1",
+    usage: { output: 40, input: 10 },
+  });
+
+  const directSum = summarizeTurn(direct, CPT, 2000);
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.steps, directSum.steps);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.outTokens, 40);
+  assert.equal(sum.outTokens, directSum.outTokens);
+  assert.equal(sum.decodeMs, directSum.decodeMs);
+  assert.equal(sum.tokPerSecDecode, directSum.tokPerSecDecode);
+});
+
+test("usage that arrives after a provisional end still closes the step", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "usage", at: 1200, usage: { output: 40, input: 10 } });
+  // The clock stays stopped, but the tokens are counted.
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, true);
+  assert.equal(s.endedAt, 1100);
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.outTokens, 40);
+  assert.equal(sum.tokPerSecDecode, 200);
+});
+
+test("the terminal payload repeats no token after the usage already landed", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "usage", at: 1200, usage: { output: 40 } });
+  s = reduceMeter(s, { t: "turn_ended", at: 1300, kind: "completed", turnId: "t1", usage: { output: 40 } });
+  assert.equal(s.steps.length, 1);
+  assert.equal(s.steps[0].outTokens, 40);
+  assert.equal(s.provisional, false);
+});
+
+test("an empty turn id is no id, not another turn", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  // The terminal carries no usable id: it must still close this turn.
+  const after = reduceMeter(s, { t: "turn_ended", at: 1200, kind: "failed", turnId: "" });
+  assert.equal(after.phase, "failed");
+  assert.equal(after.endedAt, 1200);
+});
+
+test("an empty turn id on the start is stored as no id", () => {
+  const s = reduceMeter(initialMeterState(), { t: "turn_started", at: 0, turnId: "" });
+  assert.equal(s.turnId, null);
 });
