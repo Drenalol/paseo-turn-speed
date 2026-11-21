@@ -256,3 +256,46 @@ test("destroy stops timers and ignores later refresh or store events", (t) => {
   h.store.dispatch({ t: "turn_ended", at: h.clock, kind: "completed", turnId: "t1" });
   assert.equal(h.updates.length, beforeDestroy);
 });
+
+test("a call in flight pauses the pill and says what it is waiting on", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const h = makeHarness();
+  const handle = h.bind();
+
+  h.store.dispatch({ t: "turn_started", at: h.clock, turnId: "t1" });
+  assert.equal(h.updates[h.updates.length - 1].icon, "Zap");
+
+  // A tool run is not slow decoding: the pill switches to the paused icon and
+  // names the reason, so a two-minute build does not read as a stalling model.
+  h.advanceClock(PILL_REFRESH_MS);
+  h.store.dispatch({ t: "tool_started", at: h.clock });
+  const during = h.updates[h.updates.length - 1];
+  assert.equal(during.icon, "Pause");
+  assert.match(during.label, /· tool/);
+  assert.match(during.title, /tool running/);
+
+  h.advanceClock(PILL_REFRESH_MS);
+  h.store.dispatch({ t: "tool_ended", at: h.clock });
+  const after = h.updates[h.updates.length - 1];
+  assert.equal(after.icon, "Zap");
+  assert.doesNotMatch(after.label, /· tool/);
+  assert.doesNotMatch(after.title, /tool running/);
+
+  handle.destroy();
+});
+
+test("a user wait outranks a call in flight for the paused icon", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const h = makeHarness();
+  const handle = h.bind();
+  h.store.dispatch({ t: "turn_started", at: h.clock, turnId: "t1" });
+  h.advanceClock(PILL_REFRESH_MS);
+  h.store.dispatch({ t: "tool_started", at: h.clock });
+  h.advanceClock(PILL_REFRESH_MS);
+  h.store.dispatch({ t: "user_wait_started", at: h.clock });
+  const view = h.updates[h.updates.length - 1];
+  assert.equal(view.icon, "Pause");
+  // Still a live turn: the label keeps the rate it parked on.
+  assert.equal(view.visible, true);
+  handle.destroy();
+});

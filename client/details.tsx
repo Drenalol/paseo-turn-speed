@@ -200,8 +200,15 @@ export function makeSpeedDetails(
         <Row
           styles={styles}
           label="steps"
-          value={`${summary.steps}${summary.waitMs > 0 ? ` \u00b7 tools waited ${fmtDuration(summary.waitMs)}` : ""}`}
+          value={`${summary.steps}${summary.waitMs > 0 ? ` \u00b7 gaps ${fmtDuration(summary.waitMs)}` : ""}`}
         />
+        {summary.toolMs > 0 || summary.tooling ? (
+          <Row
+            styles={styles}
+            label={summary.tooling ? "in a tool" : "tool time"}
+            value={fmtDuration(summary.toolMs)}
+          />
+        ) : null}
         {summary.userWaitMs > 0 || summary.waiting ? (
           <Row
             styles={styles}

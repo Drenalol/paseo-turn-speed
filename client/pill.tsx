@@ -75,6 +75,10 @@ export function computePillView(
   const rateText = rate === null ? "\u2014" : `${approx(fmtRate(rate), isApprox)} tok/s`;
   const running = phase === "running";
   const waiting = summary.waiting;
+  // A tool call in flight is the other way a turn produces nothing: the rate
+  // on screen is whatever was last decoded, not a live speed, so the pill says
+  // so instead of looking like a model that slowed down.
+  const tooling = summary.tooling;
   const teamRunning = team && phase === "running" && team.running > 0 ? team : null;
   // The composer track is narrow: the pill carries the decode rate plus the
   // turn's cache hit rate (when enabled) and the subagent count (when the work
@@ -86,10 +90,12 @@ export function computePillView(
     labelParts.push(`\u00b7 ${fmtPercent(summary.cacheHitRate)} cached`);
   }
   if (teamRunning) labelParts.push(`\u00b7 ${teamRunning.running} sub`);
+  if (tooling) labelParts.push("\u00b7 tool");
   if (phase === "failed") labelParts.push("\u00b7 failed");
   if (phase === "canceled") labelParts.push("\u00b7 canceled");
   const titleParts = [`Turn speed ${rateText} decode`];
   if (waiting) titleParts.push("waiting");
+  if (tooling) titleParts.push("tool running");
   if (teamRunning) {
     // Keep the sheet title on one phone line: the short `N sub` form matches
     // the pill label; the full breakdown is in the popover body.
@@ -107,7 +113,7 @@ export function computePillView(
   if (summary.cacheHitRate !== null) titleParts.push(`cache ${fmtPercent(summary.cacheHitRate)}`);
   return {
     label: labelParts.join(" "),
-    icon: waiting ? "Pause" : running ? "Zap" : "Activity",
+    icon: waiting || tooling ? "Pause" : running ? "Zap" : "Activity",
     visible: true,
     title: titleParts.join(" \u00b7 "),
   };

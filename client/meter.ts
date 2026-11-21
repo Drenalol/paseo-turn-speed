@@ -48,6 +48,12 @@ export const DEFAULT_CHARS_PER_TOKEN = 3.6;
  * usage (e.g. a previous message's late step-finish landing in this turn)
  * and folded into the baseline instead of opening a step. */
 export const DEFAULT_MAX_TOK_PER_SEC = 400;
+/** Below this a usage window cannot resolve a rate: a trailing delta of a few
+ * tokens that lands milliseconds after its own step would otherwise be
+ * charged as a burst of hundreds of tok/s (measured: 3 tokens over 8 ms).
+ * Real streamed steps decode over hundreds of milliseconds, so the floor only
+ * ever catches deltas that never had a window of their own. */
+export const MIN_MEASURABLE_WINDOW_MS = 100;
 /** Message keys remembered across turns, so a snapshot of an older message
  * arriving late is recognised as "no growth" instead of a fresh text flood. */
 const MAX_TEXT_KEYS = 32;
@@ -195,6 +201,12 @@ export interface MeterState {
   delegatedWaits: readonly UserWaitInterval[];
   /** Start of the open delegation interval, null while the agent runs alone. */
   delegatedAt: number | null;
+  /** Completed intervals where a tool (shell, edit, fetch, …) was running.
+   * The model generates nothing while a call is open, whatever the provider's
+   * usage deltas say about when the step ended. */
+  toolWaits: readonly UserWaitInterval[];
+  /** Start of the open tool interval, null while no call is in flight. */
+  toolAt: number | null;
   /** True once any real usage step landed during this turn. */
   sawUsage: boolean;
   /** Set when a usage delta was dropped as physically impossible. */
@@ -222,6 +234,13 @@ export type MeterAction =
   | { t: "delegated_started"; at: number }
   /** All subagents finished: the agent works alone again. */
   | { t: "delegated_ended"; at: number }
+  /** A tool call is running (shell, edit, fetch, …): the model produces
+   * nothing until it returns. The caller opens one interval for a batch of
+   * concurrent calls, exactly like the user-wait and delegation pairs: the
+   * end closes whatever is open, so the caller only transitions on empty↔full. */
+  | { t: "tool_started"; at: number }
+  /** The last open tool call returned. */
+  | { t: "tool_ended"; at: number }
   | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null; turnId?: string | null; provisional?: boolean }
   /** The agent switched model (or its identity just became known): a
    * thinking-exclusion verdict learned on another model must not carry. */
@@ -264,6 +283,8 @@ export function initialMeterState(): MeterState {
     pausedAt: null,
     delegatedWaits: [],
     delegatedAt: null,
+    toolWaits: [],
+    toolAt: null,
     sawUsage: false,
     stepRejected: null,
     calibInput: null,
@@ -350,17 +371,21 @@ function delta(value: number | null, previous: number): { amount: number; next: 
     : { amount: value, next: value };
 }
 
-/** Milliseconds inside [from, to] during which the model was blocked on the
- * user; those must not be charged to decode or tool-run windows. An open
- * interval counts up to `to`. */
+/** Milliseconds inside [from, to] during which the model produced nothing
+ * itself — blocked on the user, delegated to subagents, or waiting for a tool
+ * to return; none of those may be charged to a decode window. Overlapping
+ * stretches count once, and an open interval counts up to `to`. */
 function waitOverlap(state: MeterState, from: number, to: number): number {
   if (to <= from) return 0;
-  let total = 0;
-  for (const wait of state.userWaits) {
-    total += Math.max(0, Math.min(wait.end, to) - Math.max(wait.start, from));
-  }
-  if (state.pausedAt !== null) total += Math.max(0, to - Math.max(state.pausedAt, from));
-  return Math.min(total, to - from);
+  const asleep: UserWaitInterval[] = [
+    ...state.userWaits,
+    ...state.delegatedWaits,
+    ...state.toolWaits,
+  ];
+  if (state.pausedAt !== null) asleep.push({ start: state.pausedAt, end: to });
+  if (state.delegatedAt !== null) asleep.push({ start: state.delegatedAt, end: to });
+  if (state.toolAt !== null) asleep.push({ start: state.toolAt, end: to });
+  return unionOverlapMs(asleep, from, to);
 }
 
 /** Move the open user-wait interval into the completed list. */
@@ -384,6 +409,20 @@ function closeDelegated(state: MeterState, at: number): MeterState {
         delegatedWaits: [
           ...state.delegatedWaits,
           { start: state.delegatedAt, end: Math.max(at, state.delegatedAt) },
+        ],
+      };
+}
+
+/** Move the open tool interval into the completed list. */
+function closeTool(state: MeterState, at: number): MeterState {
+  return state.toolAt === null
+    ? state
+    : {
+        ...state,
+        toolAt: null,
+        toolWaits: [
+          ...state.toolWaits,
+          { start: state.toolAt, end: Math.max(at, state.toolAt) },
         ],
       };
 }
@@ -461,10 +500,14 @@ function applyUsage(
   // A delta implying more tokens than the window could physically decode is
   // not this turn's work: typically the previous (interrupted) message's
   // step-finish landing late. Absorb it into the baseline, keep the window.
+  // The other direction is just as unusable: a window of a few milliseconds
+  // (a trailing delta of 2-3 tokens landing right behind its own step) has no
+  // rate resolution at all, and prints hundreds of tok/s. Both kinds of token
+  // stay in the turn totals, they just do not buy a window.
   const threshold = maxTokPerSec ?? DEFAULT_MAX_TOK_PER_SEC;
   const impliedRate =
     stepDecodeMs > 0 ? outDelta.amount / (stepDecodeMs / 1000) : Number.POSITIVE_INFINITY;
-  if (impliedRate > threshold) {
+  if (stepDecodeMs < MIN_MEASURABLE_WINDOW_MS || impliedRate > threshold) {
     return {
       ...withCounters,
       calibInput: null,
@@ -575,9 +618,9 @@ function endTurn(
     : state;
   if (withUsage.phase === "running") {
     // A turn that ends while a question is still open closes the wait there;
-    // same for an ongoing delegation.
+    // same for an ongoing delegation or an in-flight tool call.
     return {
-      ...closeDelegated(closeWait(withUsage, at), at),
+      ...closeTool(closeDelegated(closeWait(withUsage, at), at), at),
       phase: kind,
       endedAt: at,
       endNote: note,
@@ -666,6 +709,14 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
     case "delegated_ended":
       // An end for a delegation we never saw is a no-op.
       return state.delegatedAt === null ? state : closeDelegated(state, action.at);
+    case "tool_started":
+      return state.phase === "running" && state.toolAt === null
+        ? { ...state, toolAt: action.at }
+        : state;
+    case "tool_ended":
+      // An end for a call we never saw opened (started before attach) is a
+      // no-op: there is no interval to close.
+      return state.toolAt === null ? state : closeTool(state, action.at);
     case "turn_ended":
       return endTurn(
         state,
@@ -742,8 +793,12 @@ export interface TurnSummary {
   delegatedMs: number;
   /** True while at least one subagent is running right now. */
   delegated: boolean;
+  /** Wall milliseconds spent inside tool calls (shell, edit, fetch, …). */
+  toolMs: number;
+  /** True while a tool call is in flight: the model generates nothing. */
+  tooling: boolean;
   tokPerSecDecode: number | null;
-  /** Tokens per second over turn time minus user waits. */
+  /** Tokens per second over turn time minus user waits and tool calls. */
   tokPerSecTurn: number | null;
   steps: number;
   /** Prompt tokens consumed across the turn's calls. */
@@ -906,12 +961,21 @@ export function summarizeTurn(
   let delegatedMs = 0;
   for (const wait of state.delegatedWaits) delegatedMs += Math.max(0, wait.end - wait.start);
   if (state.delegatedAt !== null && end !== null) delegatedMs += Math.max(0, end - state.delegatedAt);
+  let toolMs = 0;
+  for (const wait of state.toolWaits) toolMs += Math.max(0, wait.end - wait.start);
+  if (state.toolAt !== null && end !== null) toolMs += Math.max(0, end - state.toolAt);
   // The turn's productive time: wall clock minus the stretches where the
-  // agent produced nothing itself — blocked on the user or delegated to
-  // subagents. Overlapping stretches count once.
-  const asleep: UserWaitInterval[] = [...state.userWaits, ...state.delegatedWaits];
+  // agent produced nothing itself — blocked on the user, delegated to
+  // subagents, or waiting for a tool to return. Overlapping stretches count
+  // once.
+  const asleep: UserWaitInterval[] = [
+    ...state.userWaits,
+    ...state.delegatedWaits,
+    ...state.toolWaits,
+  ];
   if (state.pausedAt !== null && end !== null) asleep.push({ start: state.pausedAt, end });
   if (state.delegatedAt !== null && end !== null) asleep.push({ start: state.delegatedAt, end });
+  if (state.toolAt !== null && end !== null) asleep.push({ start: state.toolAt, end });
   const activeMs =
     totalMs !== null && state.startedAt !== null && end !== null
       ? Math.max(0, totalMs - unionOverlapMs(asleep, state.startedAt, end))
@@ -946,6 +1010,8 @@ export function summarizeTurn(
     waiting: state.pausedAt !== null && state.phase === "running",
     delegatedMs,
     delegated: state.delegatedAt !== null && state.phase === "running",
+    toolMs,
+    tooling: state.toolAt !== null && state.phase === "running",
     tokPerSecDecode,
     tokPerSecTurn,
     steps: state.steps.length,

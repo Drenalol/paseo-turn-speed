@@ -53,6 +53,17 @@ function isSubAgentCall(item: { name: string; detail: { type?: string } }): bool
   return item.detail.type === "sub_agent" || SUB_AGENT_TOOL_NAME.test(item.name);
 }
 
+/** Open calls of one attached agent, with the callbacks that re-derive the
+ * meter's parked intervals whenever a set changes. */
+interface OpenCalls {
+  /** Running subagent calls: the parent's own model is delegated. */
+  subCalls: Set<string>;
+  /** Running tool calls (shell, edit, fetch, …): the model waits for a result. */
+  toolCalls: Set<string>;
+  onSubChange(): void;
+  onToolChange(): void;
+}
+
 const CAL_FLUSH_MS = 2000;
 
 export default function contribute(client: PluginClientContext) {
@@ -268,14 +279,14 @@ export default function contribute(client: PluginClientContext) {
     reseed: () => void,
     waits: Set<string>,
     agentId: string,
-    subCalls: Set<string>,
-    onSubChange: () => void,
+    calls: OpenCalls,
   ): void {
     const at = Date.now();
     switch (event.type) {
       case "turn_started": {
         waits.clear();
-        subCalls.clear();
+        calls.subCalls.clear();
+        calls.toolCalls.clear();
         // Anchor to the daemon's timestamp from this very message: a ref()
         // snapshot updates on another channel and can still hold the previous
         // turn's start, which would charge that whole turn to this one.
@@ -285,13 +296,15 @@ export default function contribute(client: PluginClientContext) {
           at: start.at,
           turnId: event.turnId || null,
         });
-        onSubChange();
+        calls.onSubChange();
+        calls.onToolChange();
         break;
       }
       case "turn_completed":
         if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
-        subCalls.clear();
+        calls.subCalls.clear();
+        calls.toolCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
@@ -300,13 +313,15 @@ export default function contribute(client: PluginClientContext) {
           usage: event.usage ? mapUsage(event.usage) : undefined,
           maxTokPerSec: prefs.maxPlausibleTokPerSec,
         });
-        onSubChange();
+        calls.onSubChange();
+        calls.onToolChange();
         void refreshPrefs();
         break;
       case "turn_failed":
         if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
-        subCalls.clear();
+        calls.subCalls.clear();
+        calls.toolCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
@@ -314,12 +329,14 @@ export default function contribute(client: PluginClientContext) {
           turnId: event.turnId || null,
           note: event.error,
         });
-        onSubChange();
+        calls.onSubChange();
+        calls.onToolChange();
         break;
       case "turn_canceled":
         if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
-        subCalls.clear();
+        calls.subCalls.clear();
+        calls.toolCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
@@ -327,7 +344,8 @@ export default function contribute(client: PluginClientContext) {
           turnId: event.turnId || null,
           note: event.reason,
         });
-        onSubChange();
+        calls.onSubChange();
+        calls.onToolChange();
         break;
       case "permission_requested":
       case "permission_resolved": {
@@ -376,12 +394,29 @@ export default function contribute(client: PluginClientContext) {
           if (childId) linkChild(childId, agentId);
           if (item.callId) {
             if (item.status === "running") {
-              if (!subCalls.has(item.callId)) {
-                subCalls.add(item.callId);
-                onSubChange();
+              if (!calls.subCalls.has(item.callId)) {
+                calls.subCalls.add(item.callId);
+                calls.onSubChange();
               }
-            } else if (subCalls.delete(item.callId)) {
-              onSubChange();
+            } else if (calls.subCalls.delete(item.callId)) {
+              calls.onSubChange();
+            }
+          }
+        } else if (item.type === "tool_call") {
+          // Any other call (shell, edit, fetch, …): the model generates
+          // nothing while it runs, and providers land the step's usage after
+          // the result — so without parking the stretch, a two-minute build
+          // is billed to the decode window as if it were slow decoding.
+          // Subagent calls stay out of this set: they park the parent as
+          // delegation, and counting them here would subtract them twice.
+          if (item.callId) {
+            if (item.status === "running") {
+              if (!calls.toolCalls.has(item.callId)) {
+                calls.toolCalls.add(item.callId);
+                calls.onToolChange();
+              }
+            } else if (calls.toolCalls.delete(item.callId)) {
+              calls.onToolChange();
             }
           }
         }
@@ -391,9 +426,11 @@ export default function contribute(client: PluginClientContext) {
       case "subscription_restored":
         // Do not replay history we never saw; the live window is local anyway.
         waits.clear();
-        subCalls.clear();
+        calls.subCalls.clear();
+        calls.toolCalls.clear();
         store.dispatch({ t: "reset" });
-        onSubChange();
+        calls.onSubChange();
+        calls.onToolChange();
         // Provider counters kept moving while we were blind: re-read them so
         // the next delta is the new work, not the whole unseen gap.
         reseed();
@@ -479,6 +516,31 @@ export default function contribute(client: PluginClientContext) {
       console.log(`turn-speed: delegation ${should ? "on" : "off"} [${agent.id.slice(0, 8)}]`);
       store.dispatch({ t: should ? "delegated_started" : "delegated_ended", at: Date.now() });
     };
+    // Tools: while any call is open the agent's own model produces nothing, so
+    // the meter parks that stretch out of the decode windows and the turn rate.
+    // Concurrent calls share one interval, and a `running` item the host
+    // re-delivers must not open a second one.
+    const toolCalls = new Set<string>();
+    let toolingNow = false;
+    const syncToolWaits = (): void => {
+      const should = toolCalls.size > 0;
+      if (store.state.phase !== "running") {
+        // Outside a turn there is no interval to open or close; drop the flag
+        // so the next turn re-evaluates from scratch.
+        toolingNow = false;
+        return;
+      }
+      if (should === toolingNow) return;
+      toolingNow = should;
+      console.log(`turn-speed: tool ${should ? "running" : "idle"} [${agent.id.slice(0, 8)}]`);
+      store.dispatch({ t: should ? "tool_started" : "tool_ended", at: Date.now() });
+    };
+    const calls: OpenCalls = {
+      subCalls,
+      toolCalls,
+      onSubChange: syncDelegated,
+      onToolChange: syncToolWaits,
+    };
     // One snapshot, one ordered set of actions: identify the turn, restore the
     // waits that belong to it, then end a turn whose terminal event was lost.
     // The last step is provisional, so a real terminal event still decides the
@@ -493,6 +555,7 @@ export default function contribute(client: PluginClientContext) {
         store.dispatch(action);
         if (action.t === "turn_ended" && action.provisional) {
           subCalls.clear();
+          toolCalls.clear();
           void refreshPrefs();
         }
       }
@@ -502,6 +565,11 @@ export default function contribute(client: PluginClientContext) {
       // that attaches after its children would count their work as its own
       // until the next child event.
       syncDelegated();
+      // A call whose `running` item landed while this agent was attaching
+      // found no turn to park; re-check now that the snapshot has established
+      // one. A call that started before the subscription stays unparked: items
+      // carry no start timestamp to reconstruct it from.
+      syncToolWaits();
     }
     // A ref() handle starts empty: without a real snapshot, the first usage
     // event after a reload would count the session-cumulative counters as
@@ -591,8 +659,7 @@ export default function contribute(client: PluginClientContext) {
           reseed,
           pendingWaits,
           agent.id,
-          subCalls,
-          syncDelegated,
+          calls,
         );
       } catch (error) {
         logError(`timeline event failed for ${agent.id}`, error);
