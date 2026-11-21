@@ -1,10 +1,25 @@
-import type { PluginButton, PluginButtonRegistration } from "@getpaseo/plugin/client";
 import { approx, fmtDuration, fmtPercent, fmtRate, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
 import type { TeamView } from "./team";
-import type { Preferences } from "../shared/preferences";
 
-const PILL_REFRESH_MS = 500;
+export const PILL_REFRESH_MS = 500;
+
+/** Preference fields the pill reads, kept structural so pill logic stays
+ * testable without pulling in the settings schema. */
+export interface PillPreferences {
+  liveWindowSec: number;
+  numerator: "live" | "decode" | "turn";
+  showIdlePills: boolean;
+  tokenFormat: "compact" | "plain";
+  showCacheInPill: boolean;
+  maxPlausibleTokPerSec: number;
+}
+
+/** Minimal button registration contract, satisfied by `PluginButtonRegistration`. */
+export interface PillRegistration {
+  update(patch: PillView): void;
+  remove(): void;
+}
 
 export interface PillView {
   label: string;
@@ -13,10 +28,19 @@ export interface PillView {
   title: string;
 }
 
+export function samePillView(a: PillView, b: PillView): boolean {
+  return (
+    a.label === b.label &&
+    a.icon === b.icon &&
+    a.visible === b.visible &&
+    a.title === b.title
+  );
+}
+
 /** Number the pill leads with, per the speed-basis preference. Rates above
  * the plausibility limit are bookkeeping artifacts, not speed: show nothing
  * rather than a fabricated burst. */
-function headlineTokPerSec(store: AgentSpeedStore, prefs: Preferences, now: number): number | null {
+function headlineTokPerSec(store: AgentSpeedStore, prefs: PillPreferences, now: number): number | null {
   const summary = store.summary(now);
   const plausible = (rate: number | null): number | null =>
     rate !== null && rate > prefs.maxPlausibleTokPerSec ? null : rate;
@@ -31,7 +55,7 @@ function headlineTokPerSec(store: AgentSpeedStore, prefs: Preferences, now: numb
 
 export function computePillView(
   store: AgentSpeedStore,
-  prefs: Preferences,
+  prefs: PillPreferences,
   now: number,
   team?: TeamView | null,
 ): PillView {
@@ -90,29 +114,62 @@ export function computePillView(
 }
 
 export interface PillRegistrationHandle {
+  /** Re-evaluates the pill immediately (e.g. after a settings change) without
+   * waiting for the next store event. Still a no-op when the view is unchanged. */
+  refresh(): void;
   destroy(): void;
 }
 
 /**
  * Registers a composer pill for one agent and keeps its label fresh: redraws
- * on store changes (throttled) and on a slow timer so the live number keeps
- * moving between events.
+ * on store changes (throttled), runs a slow heartbeat only while a turn is
+ * running, and skips `registration.update()` whenever the rendered fields are
+ * unchanged so idle agents do not churn the host button store.
  */
 export function bindPill(
-  register: (button: PluginButton) => PluginButtonRegistration,
-  buttonBase: Omit<PluginButton, "label" | "icon" | "visible" | "title">,
+  register: (initial: PillView) => PillRegistration,
   store: AgentSpeedStore,
-  getPrefs: () => Preferences,
+  getPrefs: () => PillPreferences,
   now: () => number,
   getTeam?: () => TeamView | null,
 ): PillRegistrationHandle {
-  const view = (t: number) => computePillView(store, getPrefs(), t, getTeam ? getTeam() : null);
+  const view = (t: number) =>
+    computePillView(store, getPrefs(), t, store.isRunning() && getTeam ? getTeam() : null);
   const first = view(now());
-  let registration = register({ ...buttonBase, ...first });
-  let lastPaint = 0;
+  const registration = register(first);
+  let lastView: PillView = first;
+  let lastPaint = Number.NEGATIVE_INFINITY;
   let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let wasRunning = store.isRunning();
+  let destroyed = false;
+
+  const stopHeartbeat = () => {
+    if (heartbeat !== null) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
+  };
+
+  const syncHeartbeat = () => {
+    if (destroyed) return;
+    if (store.isRunning()) {
+      if (heartbeat === null) {
+        heartbeat = setInterval(() => {
+          if (destroyed || !store.isRunning()) {
+            stopHeartbeat();
+            return;
+          }
+          paint(false);
+        }, PILL_REFRESH_MS);
+      }
+    } else {
+      stopHeartbeat();
+    }
+  };
 
   const paint = (force: boolean) => {
+    if (destroyed) return;
     const t = now();
     if (!force && t - lastPaint < PILL_REFRESH_MS) {
       if (pendingTimer === null) {
@@ -123,8 +180,14 @@ export function bindPill(
       }
       return;
     }
+    if (pendingTimer !== null) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
     lastPaint = t;
     const viewNow = view(t);
+    if (samePillView(lastView, viewNow)) return;
+    lastView = viewNow;
     registration.update({
       label: viewNow.label,
       icon: viewNow.icon,
@@ -133,17 +196,33 @@ export function bindPill(
     });
   };
 
-  const unsubscribe = store.subscribe(() => paint(false));
-  // A slow heartbeat keeps the live tok/s and elapsed time honest while the
-  // agent streams but the reducer has not changed on a given tick.
-  const heartbeat = setInterval(() => paint(false), PILL_REFRESH_MS);
-  paint(true);
+  const unsubscribe = store.subscribe(() => {
+    const running = store.isRunning();
+    const phaseChanged = running !== wasRunning;
+    wasRunning = running;
+    syncHeartbeat();
+    // Flush phase transitions (start/end) immediately so a finished turn never
+    // lingers with a running icon or a dangling throttle timer.
+    paint(phaseChanged);
+  });
+  syncHeartbeat();
 
   return {
+    refresh() {
+      if (destroyed) return;
+      wasRunning = store.isRunning();
+      syncHeartbeat();
+      paint(true);
+    },
     destroy() {
+      if (destroyed) return;
+      destroyed = true;
       unsubscribe();
-      if (pendingTimer !== null) clearTimeout(pendingTimer);
-      clearInterval(heartbeat);
+      if (pendingTimer !== null) {
+        clearTimeout(pendingTimer);
+        pendingTimer = null;
+      }
+      stopHeartbeat();
       registration.remove();
     },
   };
