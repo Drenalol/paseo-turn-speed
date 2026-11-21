@@ -1057,3 +1057,36 @@ test("a window too short to measure keeps its tokens without a rate", () => {
   // The burst never enters the decode rate.
   assert.equal(Math.round(sum.tokPerSecDecode ?? 0), 100);
 });
+
+test("a delegation spanning an open step is parked out of the decode window", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "text", at: 2000, key: "m1", text: "x".repeat(800) });
+  // Two minutes of subagent work, and the step's usage only lands after it:
+  // this is a parent whose pill read 0.17 tok/s over a 20 minute window.
+  s = reduceMeter(s, { t: "delegated_started", at: 2000 });
+  s = reduceMeter(s, { t: "delegated_ended", at: 122000 });
+  s = reduceMeter(s, { t: "usage", at: 122100, usage: { output: 100 } });
+  assert.equal(s.steps.length, 1);
+  // The second of generation that actually ran, not the two minutes plus it.
+  assert.equal(s.steps[0].decodeMs, 1100);
+  const sum = summarizeTurn(s, CPT, 122100);
+  assert.equal(sum.delegatedMs, 120000);
+  assert.equal(Math.round(sum.tokPerSecDecode ?? 0), Math.round(100 / 1.1));
+});
+
+test("a delegation overlapping a tool call is subtracted once", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 1500, usage: { output: 20 } });
+  s = reduceMeter(s, { t: "text", at: 2000, key: "m2", text: "y".repeat(400) });
+  s = reduceMeter(s, { t: "delegated_started", at: 2000 });
+  s = reduceMeter(s, { t: "tool_started", at: 3000 });
+  s = reduceMeter(s, { t: "tool_ended", at: 9000 });
+  s = reduceMeter(s, { t: "delegated_ended", at: 10000 });
+  s = reduceMeter(s, { t: "usage", at: 10200, usage: { output: 60 } });
+  assert.equal(s.steps.length, 2);
+  // 2000..10000 is one parked stretch (8 s), not 8 s + 6 s: what is left of
+  // the step's generation stays as its window.
+  assert.equal(s.steps[1].decodeMs, 200);
+});

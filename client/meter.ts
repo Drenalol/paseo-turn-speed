@@ -372,13 +372,18 @@ function delta(value: number | null, previous: number): { amount: number; next: 
 }
 
 /** Milliseconds inside [from, to] during which the model produced nothing
- * itself — blocked on the user, or waiting for a tool to return; those must
- * not be charged to decode or tool-run windows. Overlapping stretches count
- * once, and an open interval counts up to `to`. */
+ * itself — blocked on the user, delegated to subagents, or waiting for a tool
+ * to return; none of those may be charged to a decode window. Overlapping
+ * stretches count once, and an open interval counts up to `to`. */
 function waitOverlap(state: MeterState, from: number, to: number): number {
   if (to <= from) return 0;
-  const asleep: UserWaitInterval[] = [...state.userWaits, ...state.toolWaits];
+  const asleep: UserWaitInterval[] = [
+    ...state.userWaits,
+    ...state.delegatedWaits,
+    ...state.toolWaits,
+  ];
   if (state.pausedAt !== null) asleep.push({ start: state.pausedAt, end: to });
+  if (state.delegatedAt !== null) asleep.push({ start: state.delegatedAt, end: to });
   if (state.toolAt !== null) asleep.push({ start: state.toolAt, end: to });
   return unionOverlapMs(asleep, from, to);
 }

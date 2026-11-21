@@ -89,11 +89,13 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   separately, never mixed into tok/s.
 - **decode tok/s** — output tokens from usage deltas divided by decode windows
   only: the stretches in which the model was generating. Tool calls, user waits,
-  thinking pauses longer than 2 s, and the prefill of the next model call are
-  excluded. This is why the pill shows ~139 tok/s on short answers instead of 6.
-  Parking tool calls matters because providers report a step's usage *after*
-  the call the step asked for: measured on a real turn, a 20 s `sleep` inside a
-  step window printed 2.3 tok/s for 2.2 s of actual decoding.
+  delegation to subagents, thinking pauses longer than 2 s, and the prefill of
+  the next model call are excluded. This is why the pill shows ~139 tok/s on
+  short answers instead of 6. Parking tool calls matters because providers
+  report a step's usage *after* the call the step asked for: measured on a real
+  turn, a 20 s `sleep` inside a step window printed 2.3 tok/s for 2.2 s of
+  actual decoding, and a parent waiting on a subagent printed 0.17 tok/s over a
+  20 minute window.
 - **Whole-turn tok/s** — optional alternative basis in settings: tokens over
   turn time minus everything the agent was not generating for — blocked on you,
   delegated to subagents, or waiting on a tool. It stays at or below the decode
@@ -118,8 +120,8 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   whole-turn rate. `turn time` stays wall-clock; the popover shows a separate
   `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
 - **Delegation to subagents** — while the agent's work runs in subagents, the
-  parent's own model produces nothing, so that stretch is removed from its
-  whole-turn rate like a user wait. A subagent's reply reaching the parent is
+  parent's own model produces nothing, so that stretch is removed from both of
+  its rates like a user wait. A subagent's reply reaching the parent is
   a tool result: it lands in the parent's *input* tokens (`in`/`cached`),
   never in its output. Delegation is detected from the parent's timeline
   (`sub_agent` tool details where the provider reports them, and the
