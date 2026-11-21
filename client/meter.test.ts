@@ -930,3 +930,130 @@ test("an empty turn id on the start is stored as no id", () => {
   const s = reduceMeter(initialMeterState(), { t: "turn_started", at: 0, turnId: "" });
   assert.equal(s.turnId, null);
 });
+
+// --- Tool calls ----------------------------------------------------------------
+// Measured in the wild on a provider that lands a step's usage after the tool
+// result: a 20 s `sleep` inside a step window printed 2.3 tok/s, and trailing
+// deltas with an 8 ms window printed 250-375 tok/s.
+
+test("a running tool is parked out of the decode window", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "text", at: 2000, key: "m1", text: "x".repeat(800) });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 100 } });
+  // The provider reports the next step's tokens only after the call returns.
+  s = reduceMeter(s, { t: "tool_started", at: 2000 });
+  s = reduceMeter(s, { t: "tool_ended", at: 22000 });
+  s = reduceMeter(s, { t: "text", at: 22100, key: "m2", text: "y".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 22500, usage: { output: 150 } });
+  assert.equal(s.steps.length, 2);
+  assert.equal(s.steps[0].decodeMs, 1000);
+  // Generation only: the 20 s call sat between this step's first character
+  // and the usage that closed it.
+  assert.equal(s.steps[1].decodeMs, 400);
+  const sum = summarizeTurn(s, CPT, 22500);
+  assert.equal(sum.toolMs, 20000);
+  assert.equal(sum.tooling, false);
+  assert.equal(Math.round(sum.tokPerSecDecode ?? 0), Math.round(150 / 1.4));
+});
+
+test("the whole-turn rate excludes tool time", () => {
+  const run = (park: boolean) => {
+    let s = startTurn(initialMeterState(), 0);
+    s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+    s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 100 } });
+    if (park) s = reduceMeter(s, { t: "tool_started", at: 1000 });
+    s = reduceMeter(s, { t: "text", at: 21000, key: "m2", text: "y".repeat(400) });
+    s = reduceMeter(s, { t: "usage", at: 21000, usage: { output: 200 } });
+    if (park) s = reduceMeter(s, { t: "tool_ended", at: 21000 });
+    s = reduceMeter(s, { t: "turn_ended", at: 21000, kind: "completed", turnId: "t1" });
+    return summarizeTurn(s, CPT, 21000);
+  };
+  const parked = run(true);
+  const charged = run(false);
+  assert.equal(parked.toolMs, 20000);
+  assert.equal(parked.totalMs, 21000);
+  // 200 tokens over the 1 s the model actually worked, not over 21 s.
+  assert.equal(Math.round(parked.tokPerSecTurn ?? 0), 200);
+  assert.equal(Math.round(charged.tokPerSecTurn ?? 0), Math.round(200 / 21));
+});
+
+test("sequential calls park one interval each", () => {
+  let s = startTurn(initialMeterState(), 0);
+  // Concurrent calls reach the meter as a single transition pair: the caller
+  // only dispatches when its set of open calls empties or fills up.
+  s = reduceMeter(s, { t: "tool_started", at: 1000 });
+  s = reduceMeter(s, { t: "tool_started", at: 1200 });
+  assert.equal(s.toolAt, 1000);
+  assert.deepEqual(s.toolWaits, []);
+  assert.equal(summarizeTurn(s, CPT, 5000).tooling, true);
+  s = reduceMeter(s, { t: "tool_ended", at: 5000 });
+  assert.equal(s.toolAt, null);
+  assert.deepEqual(s.toolWaits, [{ start: 1000, end: 5000 }]);
+  s = reduceMeter(s, { t: "tool_started", at: 6000 });
+  s = reduceMeter(s, { t: "tool_ended", at: 8000 });
+  assert.deepEqual(s.toolWaits, [
+    { start: 1000, end: 5000 },
+    { start: 6000, end: 8000 },
+  ]);
+  assert.equal(summarizeTurn(s, CPT, 8000).toolMs, 6000);
+});
+
+test("a re-delivered running item does not restart the interval", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "tool_started", at: 1000 });
+  s = reduceMeter(s, { t: "tool_started", at: 6000 });
+  assert.equal(s.toolAt, 1000);
+});
+
+test("a call still running when the turn ends closes the interval at the end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "tool_started", at: 3000 });
+  s = reduceMeter(s, { t: "turn_ended", at: 9000, kind: "canceled", turnId: "t1" });
+  assert.equal(s.toolAt, null);
+  assert.deepEqual(s.toolWaits, [{ start: 3000, end: 9000 }]);
+  const sum = summarizeTurn(s, CPT, 9000);
+  assert.equal(sum.tooling, false);
+  assert.equal(sum.toolMs, 6000);
+});
+
+test("a tool overlapping a user wait is subtracted once", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 100 } });
+  s = reduceMeter(s, { t: "user_wait_started", at: 1000 });
+  s = reduceMeter(s, { t: "tool_started", at: 2000 });
+  s = reduceMeter(s, { t: "tool_ended", at: 8000 });
+  s = reduceMeter(s, { t: "user_wait_ended", at: 9000 });
+  s = reduceMeter(s, { t: "turn_ended", at: 9000, kind: "completed", turnId: "t1" });
+  const sum = summarizeTurn(s, CPT, 9000);
+  // The intervals overlap, so the turn's productive time is 9 s minus their
+  // union (8 s) — not 9 s minus 8 s + 6 s, which would leave nothing.
+  assert.equal(sum.userWaitMs, 8000);
+  assert.equal(sum.toolMs, 6000);
+  assert.equal(sum.tokPerSecTurn, 100);
+  s = reduceMeter(startTurn(initialMeterState(), 0), { t: "reset" });
+  assert.equal(s.toolWaits.length, 0);
+  assert.equal(s.toolAt, null);
+});
+
+test("a window too short to measure keeps its tokens without a rate", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 100 } });
+  // A trailing delta 8 ms after the previous step: 3 tokens over 8 ms would
+  // read as 375 tok/s, under the plausibility cap yet no measurement at all.
+  s = reduceMeter(s, { t: "usage", at: 2008, usage: { output: 103 } });
+  assert.equal(s.steps.length, 1);
+  assert.equal(s.stepRejected?.tokens, 3);
+  assert.equal(s.stepRejected?.windowMs, 8);
+  assert.equal(s.unattributedTokens, 3);
+  const sum = summarizeTurn(s, CPT, 2008);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.outTokens, 100);
+  assert.equal(sum.estTokens, 103);
+  assert.equal(sum.unattributedTokens, 3);
+  // The burst never enters the decode rate.
+  assert.equal(Math.round(sum.tokPerSecDecode ?? 0), 100);
+});

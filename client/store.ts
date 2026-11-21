@@ -174,9 +174,10 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
         if (line !== lastRejectionLog) {
           lastRejectionLog = line;
           console.log(
-            `turn-speed: step dropped as implausible [${deps.agentId.slice(0, 8)}]` +
+            `turn-speed: step kept without a window [${deps.agentId.slice(0, 8)}]` +
               ` tokens=${next.stepRejected.tokens} windowMs=${Math.round(next.stepRejected.windowMs)}` +
-              " (late or aggregated usage; kept in the turn totals as unattributed tokens)",
+              " (implied rate above the plausibility cap, or too short to measure;" +
+              " kept in the turn totals as unattributed tokens)",
           );
         }
       }

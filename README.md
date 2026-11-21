@@ -1,11 +1,11 @@
 # turn-speed — live token-rate meter for Paseo agents
 
 A composer pill per agent that shows how fast the model is actually decoding:
-`⚡ 138 tok/s` while a turn runs, `⏸ 43 tok/s` while it waits for your answer,
-`12.4 tok/s · 2 sub` while subagents do the heavy lifting, and the final rate
-once the turn ends — with a popover breakdown (prefill/TTFT, in/out tokens,
-prompt cache hit rate, steps, tool wait, user wait, per-subagent rates,
-context occupancy). Numbers measured from real provider usage are exact; before
+`⚡ 138 tok/s` while a turn runs, `⏸ 43 tok/s` while it waits for your answer or
+for a tool to return, `12.4 tok/s · 2 sub` while subagents do the heavy lifting,
+and the final rate once the turn ends — with a popover breakdown
+(prefill/TTFT, in/out tokens, prompt cache hit rate, steps, tool time, user
+wait, per-subagent rates, context occupancy). Numbers measured from real provider usage are exact; before
 the first usage event they are character estimates marked with `≈`. For
 reasoning models whose provider subtracts thinking from the reported output
 (measured on OpenCode + local models via oMLX), the thinking tokens are
@@ -33,7 +33,7 @@ Desktop — the composer pill while a turn decodes, and the paused variant
 <img src="images/desktop-pill-live.png" alt="Live pill: 74.4 tok/s" width="200"> <img src="images/desktop-pill-waiting.png" alt="Waiting pill: 43.6 tok/s" width="200">
 
 The popover behind the pill — decode and whole-turn rates, prefill/TTFT,
-token totals, steps, tool wait and context occupancy:
+token totals, steps, tool time and context occupancy:
 
 <img src="images/desktop-popover.png" alt="Turn breakdown popover" width="420">
 
@@ -88,18 +88,35 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
 - **TTFT / prefill** — from turn start to the first streamed character. Reported
   separately, never mixed into tok/s.
 - **decode tok/s** — output tokens from usage deltas divided by decode windows
-  only. Tool waits, thinking pauses longer than 2 s, and the prefill of the next
-  model call are excluded. This is why the pill shows ~139 tok/s on short
-  answers instead of 6.
-- **Whole-turn tok/s** — optional alternative basis in settings; it includes
-  tool time and is always lower. Time spent waiting for you and time delegated
-  to subagents are excluded.
+  only: the stretches in which the model was generating. Tool calls, user waits,
+  thinking pauses longer than 2 s, and the prefill of the next model call are
+  excluded. This is why the pill shows ~139 tok/s on short answers instead of 6.
+  Parking tool calls matters because providers report a step's usage *after*
+  the call the step asked for: measured on a real turn, a 20 s `sleep` inside a
+  step window printed 2.3 tok/s for 2.2 s of actual decoding.
+- **Whole-turn tok/s** — optional alternative basis in settings: tokens over
+  turn time minus everything the agent was not generating for — blocked on you,
+  delegated to subagents, or waiting on a tool. It stays at or below the decode
+  rate because it still pays for what the meter cannot attribute (the tail of
+  argument generation, an unobserved stall).
+- **Tool calls** — while a call is open (shell, edit, fetch, …) the model
+  produces nothing, so the interval is subtracted from both rates and shown as
+  a `tool time` row; the pill switches to ⏸ with a `· tool` suffix, because the
+  number on screen is the last decoded rate rather than a live one. Intervals
+  come from the host's running → terminal item transitions, so concurrent calls
+  share one stretch and a lost terminal item parks the turn until the turn ends
+  (the same exposure a permission wait has). Subagent calls are deliberately not
+  in this set: they park the parent as delegation, and parking them twice would
+  subtract the same seconds from both rates.
+- **Steps · gaps** — the `gaps` figure is the wall time between steps that no
+  window claimed. With tool calls parked it holds only what is genuinely
+  unattributed: the argument tail, a prefill the provider did not report.
 - **Waiting for you** — when the model asks a question or waits for a permission
   or plan approval it is asleep until you answer. Those intervals are taken from
   the provider's permission/question requests (and restored from agent snapshots
-  after reloads and reconnects), and are removed from decode windows, tool-wait
-  time and the whole-turn rate. `turn time` stays wall-clock; the popover shows a
-  separate `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
+  after reloads and reconnects), and are removed from decode windows and the
+  whole-turn rate. `turn time` stays wall-clock; the popover shows a separate
+  `waiting for you` row and the pill switches to a ⏸ icon meanwhile.
 - **Delegation to subagents** — while the agent's work runs in subagents, the
   parent's own model produces nothing, so that stretch is removed from its
   whole-turn rate like a user wait. A subagent's reply reaching the parent is
@@ -226,8 +243,14 @@ check:client` runs the real Hermes syntax check too.
   [Prompt cache hit rate](#how-the-numbers-are-computed) for the exact formula
   and the plumbing already in place for when the protocol gains the field.
 - Usage that arrives late from a previous turn (typically after an interrupted
-  message) is dropped by the plausibility guard, so that turn's token totals can
+  message) is dropped by the plausibility guard, and a delta whose window is
+  too short to resolve a rate (measured: 3 tokens over 8 ms, which would read
+  as 375 tok/s) is kept in the totals without one — so a turn's token totals can
   be slightly low; rates stay honest.
+- A tool call that was already running when the plugin attached is not parked:
+  its `running` item predates the subscription, and timeline items carry no
+  start timestamp to reconstruct it from. That stretch is charged to the turn
+  rather than guessed away.
 - Every closed and dropped step is logged to the app log
   (`~/Library/Logs/Paseo/main.log`, prefix `turn-speed:`) if you want to audit
   where a number came from.
