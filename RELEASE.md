@@ -101,3 +101,15 @@ Validation rules the registries enforce (worth keeping either way):
   attach seeds only after the subscription is ready, and a snapshot closes a
   turn whose terminal event was lost provisionally). Both PRs were external
   contributions; the combined tree verified at 98 tests.
+- 2026-11-21 — v1.4.0 published: idle pills go silent (PR #3, external
+  contribution: the 500 ms heartbeat runs only while a turn runs and
+  `registration.update()` is skipped when nothing in the pill changed — measured
+  ~68% → ~2.6% Renderer CPU with ~330 loaded agents), waits are parked (PR #6:
+  tool calls and subagent delegation now leave the decode windows as well as the
+  whole-turn rate; a parent's step whose window had grown to 1 185 159 ms and
+  read 0.17 tok/s went back to the seconds the model actually generated), and a
+  usage window under 100 ms no longer buys a denominator (measured junk: 3
+  tokens over 8 ms printed 375 tok/s, under the 400 cap). `samePreferences()`
+  derives its compared keys from the settings schema (#4). Verified at 115
+  tests; publish needed the usual `/login/cli/` plus `/auth/cli/` passkey pair,
+  and both smoke installs came back `running` (npm at 1.4.0, git at the tag).
