@@ -36,17 +36,12 @@ interface Attachment {
   detach(): void;
 }
 
+/** Every preference is a primitive, so the compared keys come from the schema
+ * defaults: a field added to `preferences.schema` is diffed without touching
+ * this function, instead of silently reading as "no change" forever. */
 function samePreferences(a: Preferences, b: Preferences): boolean {
-  return (
-    a.liveWindowSec === b.liveWindowSec &&
-    a.numerator === b.numerator &&
-    a.showIdlePills === b.showIdlePills &&
-    a.manualCharsPerToken === b.manualCharsPerToken &&
-    a.tokenFormat === b.tokenFormat &&
-    a.showCacheInPill === b.showCacheInPill &&
-    a.cacheCounting === b.cacheCounting &&
-    a.maxPlausibleTokPerSec === b.maxPlausibleTokPerSec
-  );
+  const keys = Object.keys(DEFAULT_PREFERENCES) as (keyof Preferences)[];
+  return keys.every((key) => a[key] === b[key]);
 }
 
 /** Paseo normalizes subagent-spawning tool calls to the name "subagent";
