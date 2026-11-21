@@ -1,7 +1,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { settingsRpc } from "@getpaseo/plugin";
 import { createAgentSpeedStore, type AgentSpeedStore } from "./client/store";
-import { bindPill } from "./client/pill";
+import { bindPill, type PillRegistrationHandle } from "./client/pill";
 import { makeSpeedDetails } from "./client/details";
 import { parentAgentIdOf } from "./client/links";
 import {
@@ -32,7 +32,21 @@ type AgentEntry = AgentListResult["entries"][number];
 
 interface Attachment {
   store: AgentSpeedStore;
+  refreshPill(): void;
   detach(): void;
+}
+
+function samePreferences(a: Preferences, b: Preferences): boolean {
+  return (
+    a.liveWindowSec === b.liveWindowSec &&
+    a.numerator === b.numerator &&
+    a.showIdlePills === b.showIdlePills &&
+    a.manualCharsPerToken === b.manualCharsPerToken &&
+    a.tokenFormat === b.tokenFormat &&
+    a.showCacheInPill === b.showCacheInPill &&
+    a.cacheCounting === b.cacheCounting &&
+    a.maxPlausibleTokPerSec === b.maxPlausibleTokPerSec
+  );
 }
 
 /** Paseo normalizes subagent-spawning tool calls to the name "subagent";
@@ -153,7 +167,13 @@ export default function contribute(client: PluginClientContext) {
       const read = await client.rpc(settingsRpc(preferences.id).read, {});
       if (read.status === "ready") {
         const parsed = preferences.schema.safeParse(read.values);
-        if (parsed.success) prefs = parsed.data;
+        if (parsed.success) {
+          const changed = !samePreferences(prefs, parsed.data);
+          prefs = parsed.data;
+          if (changed) {
+            for (const attachment of attached.values()) attachment.refreshPill();
+          }
+        }
       }
     } catch (error) {
       logError("reading preferences failed", error);
@@ -532,14 +552,19 @@ export default function contribute(client: PluginClientContext) {
       },
       team,
     );
-    let pillHandle: { destroy(): void } | null = null;
+    let pillHandle: PillRegistrationHandle | null = null;
     try {
       pillHandle = bindPill(
-        (button) =>
-          client.addComposerPill({ id: "speed", workspaceId, agentId: agent.id, button }),
-        {
-          behavior: { kind: "popover", Content: details },
-        },
+        (initial) =>
+          client.addComposerPill({
+            id: "speed",
+            workspaceId,
+            agentId: agent.id,
+            button: {
+              behavior: { kind: "popover", Content: details },
+              ...initial,
+            },
+          }),
         store,
         () => prefs,
         () => Date.now(),
@@ -591,6 +616,9 @@ export default function contribute(client: PluginClientContext) {
 
     attached.set(agent.id, {
       store,
+      refreshPill() {
+        pillHandle?.refresh();
+      },
       detach() {
         storeTeamWatch?.();
         storeTeamWatch = null;
