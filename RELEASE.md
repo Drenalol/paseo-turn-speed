@@ -147,3 +147,20 @@ Validation rules the registries enforce (worth keeping either way):
   derives its compared keys from the settings schema (#4). Verified at 115
   tests; publish needed the usual `/login/cli/` plus `/auth/cli/` passkey pair,
   and both smoke installs came back `running` (npm at 1.4.0, git at the tag).
+- 2026-11-22 — v1.4.1 published (listing metadata only, no behavior change):
+  `paseo-plugin.json` declares `icon: assets/icon.png`, so the store card gets
+  an icon. `assets/icon.png` had shipped in every tarball since v1.0.0 — the
+  listing was missing only because the manifest never pointed at it, a leftover
+  of the paseo.cafe scanner allow-list. The registry resolves the path against
+  the pinned version
+  (`https://cdn.jsdelivr.net/npm/paseo-turn-speed@<version>/assets/icon.png`),
+  so the field only reaches the listing through this release and its bump PR;
+  `plugins/drenalol/turn-speed.json` is expected to gain `icon` while its
+  `listing.media` screenshots keep winning that field. Verified: `npm pack`
+  ships `assets/icon.png` (18 files, 82 kB), the local daemon 0.17.1 reloads the
+  manifest with the new key (`Plugin ready`), and both smoke installs came back
+  `running` with the declared icon in the installed manifest (npm at 1.4.1, git
+  at 9e1d013). Publish again needed `/login/cli/` plus `/auth/cli/`: the web
+  session had expired (`npm whoami` → 401), and the browser tab reports `Token
+  expired` on a CLI code that is already spent, which is harmless once
+  `npm whoami` answers.
