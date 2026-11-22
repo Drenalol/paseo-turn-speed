@@ -11,13 +11,17 @@ How to ship a new version of this plugin and keep the three listings in sync.
 | Official [paseo.sh/plugins](https://paseo.sh/plugins) | npm artifact ([submission #475](https://github.com/getpaseo/plugins/issues/475), merged via PR #476) | bot opens a bump PR on each npm release; a reviewer merges |
 
 Local development stays on the directory source (`paseo plugin install "$(pwd)"`);
-public installs use `npm:paseo-turn-speed`.
+public installs use `npm:paseo-turn-speed`. The listing's display metadata (icon,
+media, name, description, overview) is read from the pinned artifact, so a
+metadata-only change still ships as a release and appears once the bump PR merges.
 
 ## Cutting a release
 
 1. Bump `version` in `package.json` (semver; the npm version is the update
    identity both registries track).
-2. `npm run verify` (typecheck + unit tests + client-bundle check).
+2. `npm run verify` (typecheck + unit tests + client-bundle check), and confirm
+   every declared manifest asset ships:
+   `npm pack --dry-run --ignore-scripts | grep -E "paseo-plugin.json|assets/"`.
 3. `git commit` then `git tag vX.Y.Z`.
 4. `git push origin main --follow-tags` — tags are lightweight, so also run
    `git push origin vX.Y.Z` (`--follow-tags` only pushes annotated tags).
@@ -30,6 +34,12 @@ public installs use `npm:paseo-turn-speed`.
    paseo plugin remove turn-speed-smoke
    paseo plugin add github:Drenalol/paseo-turn-speed --id turn-speed-smoke-git
    paseo plugin remove turn-speed-smoke-git
+   ```
+8. Once the bump PR merges, confirm the listing resolved the metadata from the
+   new pin (`[None]` means the manifest field or the file inside the tarball is
+   missing):
+   ```bash
+   curl -s https://plugins.paseo.sh/index.json | python3 -c 'import json,sys;print([p.get("icon") for p in json.load(sys.stdin)["plugins"] if p["id"]=="drenalol/turn-speed"])'
    ```
 
 ## npm gotchas (learned the hard way)
@@ -52,15 +62,39 @@ public installs use `npm:paseo-turn-speed`.
   the link promptly. Without a TTY, wrap it in a PTY (`expect`) so the
   "Press ENTER to open in the browser..." prompt gets answered.
 
-## Registry conventions (history)
+## Registry conventions
 
-paseo.cafe — the community registry this plugin was listed on until it shut
-down — had a security scanner that only allowed the top-level
-`paseo-plugin.json` keys `id`, `description`, `requirements`, `build`. The
-manifest is still trimmed to that allow-list: Paseo itself supports `name`,
-`icon` and `media` (see `PluginManifestSchema` in `@getpaseo/server`) and
-`assets/icon.png` is ready, but returning those fields to the manifest is
-deliberately deferred until the official registry is checked with them.
+`paseo-plugin.json` carries `id`, `description`, `icon`, `requirements`. These
+are official listing-metadata fields
+([icons and screenshots](https://paseo.sh/docs/plugins/publishing#icons-and-screenshots))
+and a manifest declaring them needs Paseo 0.11.0 or later, which is already the
+required version. History: paseo.cafe — the community registry this plugin was
+listed on until it shut down — had a scanner that only allowed the keys `id`,
+`description`, `requirements`, `build`, so the manifest was trimmed to that
+allow-list; nothing trims it now.
+
+`name` and `media` stay out of the manifest deliberately:
+
+- The listing title comes from the humanized plugin id (`Turn Speed`), and a
+  manifest `name` would replace that string literally.
+- The record `plugins/drenalol/turn-speed.json` already carries `listing.media`
+  with the three screenshots, and a `listing` override wins over the manifest
+  **per field** — so manifest `media` would change nothing on the listing while
+  forcing `images/` into the published package (+370 kB per install).
+
+What `icon` requires:
+
+- A package-relative PNG path, forward slashes, inside the plugin directory.
+  SVG is not accepted.
+- The file must be inside the published tarball. The registry turns the path
+  into a URL pointing at the pinned version
+  (`https://cdn.jsdelivr.net/npm/paseo-turn-speed@<version>/assets/icon.png`),
+  so an icon missing from `files` becomes a broken listing image, not a
+  missing one. `assets/` is in `files`, and the icon is already published with
+  every release — declaring the field is all the listing was waiting for.
+- A manifest change only reaches the listing through a new npm release: the
+  registry reads metadata from the pinned tarball, and the bot's bump PR is
+  what re-pins it.
 
 Validation rules the registries enforce (worth keeping either way):
 
