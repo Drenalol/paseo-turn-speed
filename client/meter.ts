@@ -143,6 +143,11 @@ export interface MeterState {
   phase: TurnPhase;
   turnId: string | null;
   startedAt: number | null;
+  /** The turn was discovered while it was already running (plugin reload, app
+   * reopen, reconnect), so every event before this instant is unobserved while
+   * the clock still starts at the turn's real boundary. Null when the turn was
+   * seen from its first event. */
+  seededFrom: number | null;
   /** First assistant/reasoning growth of the turn => end of prefill. */
   firstTextAt: number | null;
   lastTextAt: number | null;
@@ -222,7 +227,13 @@ export interface MeterState {
 }
 
 export type MeterAction =
-  | { t: "turn_started"; at: number; turnId: string | null }
+  | {
+      t: "turn_started";
+      at: number;
+      turnId: string | null;
+      /** When watching began, for a turn discovered mid-flight. */
+      observedFrom?: number;
+    }
   | { t: "text"; at: number; key: string; text: string; kind?: "text" | "reasoning" }
   | { t: "usage"; at: number; usage: UsageSnapshot; maxTokPerSec?: number }
   | { t: "compaction"; at: number }
@@ -253,6 +264,7 @@ export function initialMeterState(): MeterState {
     phase: "idle",
     turnId: null,
     startedAt: null,
+    seededFrom: null,
     firstTextAt: null,
     lastTextAt: null,
     stepFirstTextAt: null,
@@ -652,6 +664,15 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
         phase: "running",
         turnId: action.turnId || null,
         startedAt: action.at,
+        // A seed marks the turn as only partly observed. A live `turn_started`
+        // for the turn already being tracked (a re-announce after a
+        // resubscribe) cannot undo that mark: the events before the seed are
+        // still missing.
+        seededFrom:
+          action.observedFrom ??
+          (action.turnId && state.phase === "running" && state.turnId === action.turnId
+            ? state.seededFrom
+            : null),
         ctxMax: state.ctxMax,
         ctxUsed: state.ctxUsed,
         textLens: state.textLens,
@@ -811,6 +832,12 @@ export interface TurnSummary {
   promptTokens: number;
   /** Cached share of `promptTokens` (0..1); null without prompt data. */
   cacheHitRate: number | null;
+  /** Turn time and the token totals cover different stretches: the turn was
+   * discovered mid-flight, so no rate over the whole turn is claimed (a partial
+   * total is never shown), and `observedMs` says what was actually watched. */
+  partial: boolean;
+  /** Wall time watched by this plugin; null unless the turn is partial. */
+  observedMs: number | null;
   /** Prompt tokens of the first step, for the prefill rate. */
   firstStepPromptTokens: number | null;
   /** Cached prompt tokens of the first step: with a warm cache the prompt
@@ -972,12 +999,19 @@ export function summarizeTurn(
     estTokens = wholeEst;
     approx = true;
   }
+  // A turn discovered mid-flight has no observed prefill: the first text we
+  // saw arrived long after the real one, so the gap measures the attach, not
+  // the model.
   const prefillMs =
-    state.firstTextAt !== null && state.startedAt !== null
+    state.seededFrom === null && state.firstTextAt !== null && state.startedAt !== null
       ? Math.max(0, state.firstTextAt - state.startedAt)
       : null;
   const end = state.endedAt ?? (state.phase === "running" ? now : null);
   const totalMs = state.startedAt !== null && end !== null ? Math.max(0, end - state.startedAt) : null;
+  // What this plugin actually watched of a partly observed turn, for the row
+  // that explains why its totals are smaller than the provider's.
+  const observedMs =
+    state.seededFrom !== null && end !== null ? Math.max(0, end - state.seededFrom) : null;
   let userWaitMs = 0;
   for (const wait of state.userWaits) userWaitMs += Math.max(0, wait.end - wait.start);
   if (state.pausedAt !== null && end !== null) userWaitMs += Math.max(0, end - state.pausedAt);
@@ -1010,7 +1044,9 @@ export function summarizeTurn(
   const tokPerSecDecode =
     decodeMs > 0 && decodeTokens > 0 ? decodeTokens / (decodeMs / 1000) : null;
   const tokPerSecTurn =
-    activeMs !== null && activeMs > 0 && estTokens > 0 ? estTokens / (activeMs / 1000) : null;
+    state.seededFrom === null && activeMs !== null && activeMs > 0 && estTokens > 0
+      ? estTokens / (activeMs / 1000)
+      : null;
   // The counter shape is one property of the turn, not of a call: one cache-cold
   // call must not have its cache reads read back into the prompt it missed.
   const cacheMode: CacheCountingMode =
@@ -1030,6 +1066,8 @@ export function summarizeTurn(
     outTokens,
     estTokens,
     approx,
+    partial: state.seededFrom !== null,
+    observedMs,
     decodeMs,
     waitMs,
     prefillMs,

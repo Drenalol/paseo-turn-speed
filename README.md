@@ -233,6 +233,11 @@ check:client` runs the real Hermes syntax check too.
   provider's per-call usage updates. Providers without usage at all stay `≈`.
 - The plugin only counts what it watches live: after a reload or a reconnect the
   interrupted turn is not reconstructed (final `lastUsage` still gives totals).
+  Such a turn is marked `partial`: its `turn time` stays the real one (the
+  daemon's turn boundary), while `steps`, `tokens` and `cache hit` cover only
+  the watched stretch, so the popover shows `observed 1m10s of 8m57s` and hides
+  `whole turn` and `prefill / TTFT` rather than dividing a partial token count
+  by the whole turn.
 - Subagent turns get their own pills; the parent's numbers stay its own and
   subagent *tokens* are never added to them — delegation time is excluded and
   team rates are shown alongside, not merged. Paseo-native (delegated) agents

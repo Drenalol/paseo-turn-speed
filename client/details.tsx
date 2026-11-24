@@ -157,11 +157,13 @@ export function makeSpeedDetails(
         {running && live !== null ? (
           <Row styles={styles} label={`live (${prefs.liveWindowSec}s)`} value={fmtTokPerSec(live, summary.approx)} />
         ) : null}
-        <Row
-          styles={styles}
-          label="whole turn"
-          value={fmtTokPerSec(summary.tokPerSecTurn, summary.approx)}
-        />
+        {summary.tokPerSecTurn !== null ? (
+          <Row
+            styles={styles}
+            label="whole turn"
+            value={fmtTokPerSec(summary.tokPerSecTurn, summary.approx)}
+          />
+        ) : null}
         {summary.prefillMs !== null ? (
           <Row styles={styles} label="prefill / TTFT" value={prefillValue ?? "\u2014"} />
         ) : null}
@@ -251,7 +253,20 @@ export function makeSpeedDetails(
         {summary.totalMs !== null ? (
           <Row styles={styles} label="turn time" value={fmtDuration(summary.totalMs)} />
         ) : null}
+        {summary.partial && summary.observedMs !== null && summary.totalMs !== null ? (
+          <Row
+            styles={styles}
+            label="observed"
+            value={`${fmtDuration(summary.observedMs)} of ${fmtDuration(summary.totalMs)}`}
+          />
+        ) : null}
         <Row styles={styles} label="calibration" value={`${cpt.toFixed(1)} chars/tok`} />
+        {summary.partial ? (
+          <Text style={styles.hint}>
+            Discovered while it was running: steps, tokens and cache cover the observed stretch
+            only, so no whole-turn rate is claimed.
+          </Text>
+        ) : null}
         {noUsage ? (
           <Text style={styles.hint}>
             {store.everSawUsage

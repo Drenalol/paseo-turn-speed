@@ -86,9 +86,21 @@ test("attaching mid-turn establishes the turn before restoring its wait", () => 
   const state = apply(initialMeterState(), result.actions);
   assert.equal(state.phase, "running");
   assert.equal(state.turnId, "t1");
+  // The clock starts at the turn's real boundary while the observed stretch
+  // begins at the attach, so turn totals never claim the unseen part.
+  assert.equal(state.startedAt, T0);
+  assert.equal(state.seededFrom, T0 + 2_000);
   // The pause is attached to the turn, not dropped as "no turn yet".
   assert.equal(state.pausedAt, T0 + 2_000);
   assert.deepEqual(result.pendingWaits, ["req-1"]);
+});
+
+test("a turn announced while the plugin already watches it is not partly observed", () => {
+  const live = reduceMeter(initialMeterState(), { t: "turn_started", at: T0, turnId: "t1" });
+  assert.equal(live.seededFrom, null);
+  const next = reconcileSnapshot(live, snapshot(), T0 + 2_000, { seed: true });
+  assert.deepEqual(next.actions.filter((a) => a.t === "turn_started"), []);
+  assert.equal(apply(live, next.actions).seededFrom, null);
 });
 
 test("seeding waits for the subscription and only seeds a running snapshot", () => {
@@ -188,6 +200,7 @@ test("an empty turn id in a snapshot is no id", () => {
     { seed: true },
   );
   assert.deepEqual(result.actions, [
-    { t: "turn_started", at: T0, turnId: null },
+    // `observedFrom` marks the attach instant: the turn is only watched from here.
+    { t: "turn_started", at: T0, turnId: null, observedFrom: T0 + 2_000 },
   ]);
 });

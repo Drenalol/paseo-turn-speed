@@ -109,6 +109,9 @@ export function reconcileSnapshot(
       t: "turn_started",
       at: start.at,
       turnId: snapshot.activeTurn.turnId || null,
+      // The turn is only observed from here on: the meter must not turn its
+      // real boundary into a denominator for tokens it never saw.
+      observedFrom: now,
     });
   }
 

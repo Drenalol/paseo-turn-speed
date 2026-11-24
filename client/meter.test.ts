@@ -473,6 +473,54 @@ test("an explicit cache mode overrides the shape inferred from the turn", () => 
   assert.equal(summarizeTurn(s, CPT, 1800, "separate").promptTokens, 51_026);
 });
 
+test("a turn discovered mid-flight claims no prefill and no whole-turn rate", () => {
+  // The plugin reloaded while the turn was running. The clock still starts at
+  // the turn's real boundary, so `turn time` stays honest, but tokens only
+  // cover what is watched from here on: dividing them by the whole turn is the
+  // artifact that printed 4.9 tok/s for a 36 tok/s model.
+  let s = reduceMeter(initialMeterState(), {
+    t: "turn_started",
+    at: 0,
+    turnId: "t1",
+    observedFrom: 80_000,
+  });
+  s = reduceMeter(s, { t: "text", at: 81_000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "usage", at: 85_000, usage: { output: 100, input: 50 } });
+  const sum = summarizeTurn(s, CPT, 90_000);
+  assert.equal(sum.partial, true);
+  assert.equal(sum.prefillMs, null);
+  assert.equal(sum.tokPerSecTurn, null);
+  assert.ok(sum.tokPerSecDecode !== null && sum.tokPerSecDecode > 0);
+  assert.equal(sum.totalMs, 90_000);
+  assert.equal(sum.observedMs, 10_000);
+
+  // The same turn watched from its first event keeps both rows.
+  let f = reduceMeter(initialMeterState(), { t: "turn_started", at: 0, turnId: "t1" });
+  f = reduceMeter(f, { t: "text", at: 1_000, key: "m1", text: "x".repeat(400) });
+  f = reduceMeter(f, { t: "usage", at: 5_000, usage: { output: 100, input: 50 } });
+  const full = summarizeTurn(f, CPT, 10_000);
+  assert.equal(full.partial, false);
+  assert.equal(full.prefillMs, 1_000);
+  assert.ok(full.tokPerSecTurn !== null && full.tokPerSecTurn > 0);
+  assert.equal(full.observedMs, null);
+});
+
+test("a re-announced turn_started keeps the mark of a partly observed turn", () => {
+  const seeded = reduceMeter(initialMeterState(), {
+    t: "turn_started",
+    at: 0,
+    turnId: "t1",
+    observedFrom: 5_000,
+  });
+  // Resubscribing can re-announce the turn being tracked; the events before the
+  // seed are still missing, so the mark survives. A new turn does not inherit it.
+  assert.equal(reduceMeter(seeded, { t: "turn_started", at: 0, turnId: "t1" }).seededFrom, 5_000);
+  assert.equal(
+    reduceMeter(seeded, { t: "turn_started", at: 9_000, turnId: "t2" }).seededFrom,
+    null,
+  );
+});
+
 test("repeated snapshots never inflate the cache hit rate", () => {
   let s = startTurn();
   s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
