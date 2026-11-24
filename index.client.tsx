@@ -6,6 +6,7 @@ import { makeSpeedDetails } from "./client/details";
 import { parentAgentIdOf } from "./client/links";
 import {
   reconcileSnapshot,
+  timestampMs,
   turnStartFromEvent,
 } from "./client/lifecycle";
 import { summarizeTeam, type TeamMemberInput } from "./client/team";
@@ -291,6 +292,15 @@ export default function contribute(client: PluginClientContext) {
         // snapshot updates on another channel and can still hold the previous
         // turn's start, which would charge that whole turn to this one.
         const start = turnStartFromEvent(eventTimestamp, at);
+        // Paseo's own turn footer counts from the user's message row. When the
+        // daemon announces `turn_started` later than that row, this meter's
+        // clock is short by the difference, so log the anchor it chose and how
+        // long this message took to arrive.
+        console.log(
+          `turn-speed: turn started [${agentId.slice(0, 8)}]` +
+            ` anchor ${start.source}` +
+            ` lead ${((at - start.at) / 1000).toFixed(1)}s`,
+        );
         store.dispatch({
           t: "turn_started",
           at: start.at,
@@ -379,6 +389,22 @@ export default function contribute(client: PluginClientContext) {
           });
         } else if (item.type === "compaction") {
           store.dispatch({ t: "compaction", at });
+        } else if (item.type === "user_message") {
+          // The other half of the comparison: Paseo's turn footer opens the
+          // turn at this row, so log how far the row sits from this meter's
+          // anchor. `empty` marks the row that opened the turn; without it the
+          // row is a steer, which Paseo still counts inside the same turn.
+          const sentAt = timestampMs(eventTimestamp);
+          const opening = store.state.steps.length === 0 && store.state.totalChars === 0;
+          console.log(
+            `turn-speed: prompt row [${agentId.slice(0, 8)}]` +
+              ` ${
+                sentAt === null
+                  ? "no timestamp"
+                  : `${((((store.state.startedAt ?? at) - sentAt) / 1000).toFixed(1))}s before the clock`
+              }` +
+              ` phase ${store.state.phase}${opening ? " empty" : ""}`,
+          );
         } else if (item.type === "tool_call" && isSubAgentCall(item)) {
           // A subagent call: running/closed drives the parent's delegation
           // interval, and its child session id (when the provider reports

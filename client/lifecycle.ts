@@ -53,6 +53,10 @@ function parseTimestamp(value: string | null | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** Epoch milliseconds carried by a stream message, or null when it carries none.
+ * Exposed so callers can compare the daemon's clock with their own anchor. */
+export const timestampMs = parseTimestamp;
+
 /** Anchor a live `turn_started` to the daemon timestamp carried by the stream
  * message, clamped so the clock never starts in the future. Events arrive in
  * order on one subscription, so the timestamp of the latest one is the turn
