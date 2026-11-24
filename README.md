@@ -41,6 +41,33 @@ The same popover on mobile, with the `pill shows` basis chips:
 
 <img src="images/mobile-popover.png" alt="Mobile popover" width="300">
 
+## How this differs from Paseo's own turn stats
+
+Paseo [0.17.2](https://paseo.sh/changelog#release-0.17.2) added a stats icon to a
+completed turn's footer ([#10496](https://github.com/getpaseo/paseo/pull/10496)):
+the provider's own rows for that turn, plus session rows in the context-window
+popover. It answers *what did that turn cost*; this plugin answers *what is it
+doing right now*, so both can stay on and neither hides the other.
+
+| | Paseo turn stats | turn-speed |
+| --- | --- | --- |
+| When | after the turn ends | while it runs, and after |
+| Source | the daemon re-reading the provider's stored history | the events the client already receives |
+| Rate | one `Response` number: the last reply's stream, prefill excluded, and no row at all when the final step ran a tool | every step of the turn pooled into `decode`, a `live` window over the last seconds, and a whole-turn basis to choose from |
+| Thinking | exact where the provider reports reasoning separately | estimated from the streamed reasoning text and marked `≈`, for providers that subtract it from `output` |
+| Pauses | not tracked | the pill turns ⏸ while a tool runs or the model waits for you; delegation and user waits leave both rates |
+| Subagents | none | `· N sub` on the pill, per-subagent rates and a team total in the popover |
+| Providers | Claude, OpenCode v2, Pi, Oh My Pi; Codex, ACP and plugin providers report a model row only | any provider that streams text, plugin providers included |
+
+Where the two measure the same window they agree: on a measured OpenCode turn
+Paseo printed `Whole turn ~33 tok/s` against the pill's `34.0` (theirs uses
+measured tokens, ours character estimates until the first usage event lands, so
+`≈`). Where they disagree they describe different windows, not a different
+model: Paseo's `Response` is the fastest window of the turn (the final reply,
+between its first token and the end of its stream), while our `decode` averages
+every step including tool-argument generation and stalls, so the first is
+usually the higher number.
+
 ## Requirements
 
 - Paseo **0.11.0+** (daemon and app).
