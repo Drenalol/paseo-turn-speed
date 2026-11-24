@@ -434,6 +434,45 @@ test("a cache read larger than the prompt means disjoint counters", () => {
   assert.equal(sum.cacheHitRate, 0.91);
 });
 
+test("a cache-cold call does not switch the rest of the turn to the inclusive shape", () => {
+  // A separate-counter provider (Anthropic-style, and OpenCode's usage) whose
+  // first call ran with a cold cache: that call alone reads as inclusive,
+  // because its prompt is larger than its cache read. Deciding per call then
+  // drops the first call's cache reads from the denominator while keeping them
+  // in the numerator: this is how a 61% turn used to print 86%.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 20_000, cached: 15_000 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  // The proof of the shape: 16000 cache reads against 26 new prompt tokens.
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 20_026, cached: 31_000 } });
+  const sum = summarizeTurn(s, CPT, 1800);
+  assert.equal(sum.inputTokens, 20_026);
+  assert.equal(sum.cachedTokens, 31_000);
+  assert.equal(sum.promptTokens, 51_026);
+  // One shape for the turn, so the parts always add up to the whole prompt.
+  assert.equal(
+    sum.promptTokens,
+    sum.inputTokens + sum.cacheWriteTokens + sum.cachedTokens,
+  );
+  assert.equal(sum.cacheHitRate, 31_000 / 51_026);
+});
+
+test("an explicit cache mode overrides the shape inferred from the turn", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 20_000, cached: 15_000 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 20_026, cached: 31_000 } });
+  // Forced inclusive: every read already sits inside its prompt, and the clamp
+  // keeps the impossible totals from printing above 100%.
+  const inclusive = summarizeTurn(s, CPT, 1800, "inclusive");
+  assert.equal(inclusive.promptTokens, 20_026);
+  assert.equal(inclusive.cacheHitRate, 1);
+  // Forced separate matches what auto infers from the second call.
+  assert.equal(summarizeTurn(s, CPT, 1800, "separate").promptTokens, 51_026);
+});
+
 test("repeated snapshots never inflate the cache hit rate", () => {
   let s = startTurn();
   s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });

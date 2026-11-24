@@ -97,7 +97,7 @@ export interface UsageSnapshot {
    * process, so it belongs in the cache-hit denominator.
    *
    * Paseo's AgentUsage carries no such field today (see the note on
-   * `PromptTotals`), so the client always sends 0; the slot exists so a
+   * `cacheStats`), so the client always sends 0; the slot exists so a
    * provider that starts reporting it changes one mapper, not the formula.
    */
   cacheWrite?: number | null;
@@ -831,10 +831,33 @@ export interface TurnSummary {
  *   tokens, so the prompt total is `inputTokens`.
  * - `separate` (Anthropic-style): `inputTokens` is only the uncached part and
  *   cache reads are reported on top, so the total is their sum.
- * - `auto`: infer per turn — cache reads larger than the prompt can only mean
- *   separate counters; otherwise assume the prompt already includes them.
+ * - `auto`: infer from this call alone — cache reads larger than the prompt can
+ *   only mean separate counters; otherwise assume the prompt includes them.
+ *   Summarizing a turn, decide with `turnReportsSeparateCache` instead and pass
+ *   an explicit mode, so one call cannot use a different shape from the rest.
  */
 export type CacheCountingMode = "auto" | "inclusive" | "separate";
+
+/**
+ * Whether a turn's calls report cache reads outside the prompt counter.
+ *
+ * One call cannot tell the two shapes apart: a large uncached prompt and a
+ * small cache read are the same pair of numbers whichever way the counters are
+ * arranged. A whole turn can, because the shapes make different promises — an
+ * inclusive provider can never report more cache reads than its prompt, so one
+ * call that does proves disjoint counters for every call of the turn.
+ *
+ * Deciding per call instead lets a cache-cold call (a large prompt, a modest
+ * cache read) fall back to the inclusive reading, and that call's cache reads
+ * then stay out of the denominator while still counting in the numerator.
+ * Measured on a real OpenCode turn: one such call moved 16k cache reads out of
+ * the denominator and printed 86% where the prompt was 76% cache reads.
+ */
+export function turnReportsSeparateCache(
+  steps: readonly { inputTokens: number; cachedTokens: number }[],
+): boolean {
+  return steps.some((step) => step.cachedTokens > 0 && step.cachedTokens > step.inputTokens);
+}
 
 /**
  * Prompt totals for one model call.
@@ -988,12 +1011,17 @@ export function summarizeTurn(
     decodeMs > 0 && decodeTokens > 0 ? decodeTokens / (decodeMs / 1000) : null;
   const tokPerSecTurn =
     activeMs !== null && activeMs > 0 && estTokens > 0 ? estTokens / (activeMs / 1000) : null;
-  // Each call is normalised on its own, then summed: a turn can mix providers'
-  // shapes, and a per-call decision is far more reliable than a merged one.
+  // The counter shape is one property of the turn, not of a call: one cache-cold
+  // call must not have its cache reads read back into the prompt it missed.
+  const cacheMode: CacheCountingMode =
+    cacheCounting === "separate" ||
+    (cacheCounting === "auto" && turnReportsSeparateCache(state.steps))
+      ? "separate"
+      : "inclusive";
   let promptTokens = 0;
   let hitTokens = 0;
   for (const step of state.steps) {
-    const stepCache = cacheStats(step.inputTokens, step.cachedTokens, cacheCounting, step.cacheWriteTokens);
+    const stepCache = cacheStats(step.inputTokens, step.cachedTokens, cacheMode, step.cacheWriteTokens);
     promptTokens += stepCache.promptTokens;
     hitTokens += stepCache.cachedTokens;
   }

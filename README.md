@@ -136,14 +136,21 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   per model call, summed over the turn. The numerator is the prompt the model
   did not have to recompute; the denominator is the whole prompt, so cache
   writes count against the rate — they are tokens the model had to process even
-  though they missed the cache. Shown in the popover, and in the pill label
-  when enabled in settings.
+  though they missed the cache. Providers disagree on whether their prompt
+  counter already contains the cache reads, and a single call cannot tell the
+  two shapes apart (a large uncached prompt and a small cache read are the same
+  pair of numbers), so the shape is inferred once per turn: a call whose cache
+  reads exceed its prompt counter is only possible with disjoint counters, and
+  it decides for every call of that turn. One shape per turn is also what keeps
+  `in + cacheWrite + cached` equal to the reported prompt total; a cache-cold
+  call judged on its own pulled its cache reads out of the denominator, which is
+  the case `client/meter.test.ts` pins (61% printed as 86%). Settings can force
+  either shape. Shown in the popover, and in the pill label when enabled in settings.
 
-  Providers report cache reads in two shapes: OpenAI-compatible ones fold them
-  into the prompt counter, Anthropic-style ones report cache reads on top of it.
-  The plugin infers the shape per call (a cache read larger than the prompt can
-  only mean separate counters) and Settings → Turn speed → Prompt cache can pin
-  it explicitly.
+  OpenAI-compatible providers fold cache reads into the prompt counter and
+  Anthropic-style ones (Claude, OpenCode) report them on top of it; Settings →
+  Turn speed → Prompt cache pins either shape when a provider confuses the
+  inference.
 
   Paseo's `AgentUsage` exposes only `inputTokens` and `cachedInputTokens`, with
   no cache-write counter, so the `cacheWrite` term is always `0` today and the

@@ -161,7 +161,7 @@ export function makeSettingsScreen(onSaved: () => void): ComponentType<PluginSur
           <SettingsCard>
             <SettingsSelect
               label="How cache reads are reported"
-              hint="Auto infers from the numbers (cache reads larger than the prompt can only mean separate counters). Claude reports cache reads on top of the prompt; most OpenAI-compatible providers fold them in."
+              hint="Auto infers the shape from the turn: one call whose cache reads exceed its prompt can only mean separate counters, and it decides for every call. Claude and OpenCode report cache reads on top of the prompt; most OpenAI-compatible providers fold them in."
               value={values.cacheCounting}
               options={[
                 { label: "Auto (default)", value: "auto" },
